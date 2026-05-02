@@ -10,6 +10,16 @@ local list_renderer = require('fff.list_renderer')
 local scrollbar = require('fff.scrollbar')
 local rust = require('fff.rust')
 
+--- Saved state from the last closed file picker, used by resume().
+--- Populated in close() just before state is cleared.
+local last_file_picker_state = nil
+--- Saved state from the last closed grep picker, used by resume().
+--- Populated in close() just before state is cleared.
+local last_grep_picker_state = nil
+--- Tracks which mode was closed most recently ('files' or 'grep').
+--- Used by resume() to pick which state to restore.
+local last_closed_mode = nil
+
 --- Base path of picker can change that's why we can not rely on relative
 --- path for reading/opening files. This function resolves correct absolute path
 --- @param relative_path string|nil
@@ -2557,11 +2567,219 @@ function M.relayout()
   M.update_status()
 end
 
-function M.close()
+--- Save the current picker state for later resume, then close.
+local function save_state_and_close()
   if not M.state.active then return end
 
-  vim.cmd('stopinsert')
+  -- Build the state snapshot
+  local snapshot = {
+    config = M.state.config,
+    mode = M.state.mode,
+    renderer = M.state.renderer,
+    grep_config = M.state.grep_config,
+    grep_mode = M.state.grep_mode,
+    query = M.state.query or '',
+    current_file_cache = M.state.current_file_cache,
+    pagination = vim.deepcopy(M.state.pagination),
+    cursor = M.state.cursor,
+    location = vim.deepcopy(M.state.location),
+    items = vim.deepcopy(M.state.items),
+    filtered_items = vim.deepcopy(M.state.filtered_items),
+    combo_visible = M.state.combo_visible,
+    combo_initial_cursor = M.state.combo_initial_cursor,
+    suggestion_items = vim.deepcopy(M.state.suggestion_items),
+    suggestion_source = M.state.suggestion_source,
+    selected_files = vim.deepcopy(M.state.selected_files),
+    selected_items = vim.deepcopy(M.state.selected_items),
+  }
+
+  -- Get base path from the file picker or current config
+  local fuzzy = require('fff.core').ensure_initialized()
+  local ok, base_path = pcall(fuzzy.get_base_path)
+  if ok and base_path then
+    snapshot.base_path = base_path
+  else
+    snapshot.base_path = M.state.config and M.state.config.base_path or nil
+  end
+
+  -- Save to the mode-specific slot
+  if M.state.mode == 'grep' then
+    last_grep_picker_state = snapshot
+    last_closed_mode = 'grep'
+  else
+    last_file_picker_state = snapshot
+    last_closed_mode = 'files'
+  end
+
+  M.close_windows()
+end
+
+--- Internal: restore picker from a saved state snapshot.
+---@param state table The saved state table
+---@param source_label string Label for error messages
+---@return boolean
+local function restore_from_state(state, source_label)
+  -- Ensure the file picker is initialized
+  if not file_picker.is_initialized() then
+    if not file_picker.setup() then
+      vim.notify('Failed to initialize file picker', vim.log.levels.ERROR)
+      return false
+    end
+  end
+
+  -- Restore the picker with the saved config and mode
+  M.state.renderer = state.renderer
+  M.state.mode = state.mode
+  M.state.grep_config = state.grep_config
+  M.state.grep_mode = state.grep_mode
+  M.state.selected_files = vim.deepcopy(state.selected_files or {})
+  M.state.selected_items = vim.deepcopy(state.selected_items or {})
+
+  -- Restore the saved base_path for the indexer if it differs from the current CWD
+  if state.base_path then
+    M.change_indexing_directory(state.base_path)
+  end
+
+  -- Merge saved config with current defaults (to pick up any user config changes since last close)
+  local config = conf.get()
+  local merged_config = vim.tbl_deep_extend('force', config, {
+    renderer = state.renderer,
+    mode = state.mode,
+    grep_config = state.grep_config,
+  })
+  M.state.config = merged_config
+
+  if not M.create_ui() then
+    vim.notify('FFF: failed to create picker UI for ' .. source_label, vim.log.levels.ERROR)
+    return false
+  end
+
+  M.state.active = true
+  M.state.current_file_cache = state.current_file_cache
+
+  -- Restore the full picker state
+  M.state.query = state.query
+  M.state.items = state.items or {}
+  M.state.filtered_items = state.filtered_items or {}
+  M.state.cursor = math.min(state.cursor or 1, #(state.filtered_items or {}))
+  M.state.cursor = math.max(M.state.cursor, 1)
+  M.state.location = state.location
+  M.state.pagination = vim.deepcopy(state.pagination or {
+    page_index = 0,
+    page_size = 20,
+    total_matched = 0,
+    prefetch_margin = 5,
+    grep_file_offsets = {},
+    grep_next_file_offset = 0,
+  })
+  M.state.combo_visible = state.combo_visible ~= false
+  M.state.combo_initial_cursor = state.combo_initial_cursor
+  M.state.suggestion_items = state.suggestion_items
+  M.state.suggestion_source = state.suggestion_source
+
+  -- Set the query text in the input buffer
+  if state.query and state.query ~= '' then
+    vim.api.nvim_buf_set_lines(M.state.input_buf, 0, -1, false, { M.state.config.prompt .. state.query })
+  end
+
+  -- Render the restored state
+  M.render_list()
+  M.update_preview()
+  M.update_status()
+
+  vim.api.nvim_set_current_win(M.state.input_win)
+
+  -- Position cursor at end of query
+  vim.schedule(function()
+    if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
+      local prompt_len = #M.state.config.prompt
+      vim.api.nvim_win_set_cursor(M.state.input_win, { 1, prompt_len + #state.query })
+      vim.cmd('startinsert!')
+    end
+  end)
+
+  M.monitor_scan_progress(0)
+  return true
+end
+
+--- Resume the most recently closed picker, regardless of mode.
+---@return boolean true if a picker was resumed, false if there is nothing to resume
+function M.resume()
+  if M.state.active then
+    vim.notify('FFF: close the current picker before resuming', vim.log.levels.INFO)
+    return false
+  end
+
+  -- Pick the most recently closed mode
+  if last_closed_mode == 'grep' then
+    return M.resume_live_grep()
+  elseif last_closed_mode == 'files' then
+    return M.resume_find_files()
+  end
+
+  -- Fallback: try grep state, then file state, then open an empty find_files picker
+  if last_grep_picker_state then
+    return restore_from_state(last_grep_picker_state, 'grep resume')
+  end
+  if last_file_picker_state then
+    return restore_from_state(last_file_picker_state, 'files resume')
+  end
+
+  -- Nothing saved: open an empty find_files picker
+  return M.open()
+end
+
+--- Resume the last file picker (find_files mode).
+--- Falls back to opening a new find_files picker if nothing to resume.
+---@param opts? table Optional config overrides for fallback open
+---@return boolean
+function M.resume_find_files(opts)
+  if M.state.active then
+    vim.notify('FFF: close the current picker before resuming', vim.log.levels.INFO)
+    return false
+  end
+
+  if not last_file_picker_state then
+    -- Nothing saved: open a new find_files picker
+    return M.open(opts)
+  end
+
+  return restore_from_state(last_file_picker_state, 'find_files resume')
+end
+
+--- Resume the last live_grep picker.
+--- Falls back to opening a new live_grep picker if nothing to resume.
+---@param opts? table Optional config overrides for fallback open
+---@return boolean
+function M.resume_live_grep(opts)
+  if M.state.active then
+    vim.notify('FFF: close the current picker before resuming', vim.log.levels.INFO)
+    return false
+  end
+
+  if not last_grep_picker_state then
+    -- Nothing saved: open a new live_grep picker
+    local config = conf.get()
+    local grep_renderer = require('fff.grep.grep_renderer')
+    local grep_config = vim.tbl_deep_extend('force', config.grep or {}, (opts and opts.grep) or {})
+    M.open(vim.tbl_deep_extend('force', {
+      mode = 'grep',
+      renderer = grep_renderer,
+      grep_config = grep_config,
+      title = 'Live Grep',
+    }, opts or {}))
+    return true
+  end
+
+  return restore_from_state(last_grep_picker_state, 'live_grep resume')
+end
+
+function M.close_windows()
+  if not M.state.active then return end
+
   M.state.active = false
+
+  vim.cmd('stopinsert')
 
   restore_paste(M.state.restore_paste)
 
@@ -2638,6 +2856,10 @@ function M.close()
   M.reset_history_state()
   -- Clean up picker focus autocmds
   pcall(vim.api.nvim_del_augroup_by_name, 'fff_picker_focus')
+end
+
+function M.close()
+  save_state_and_close()
 end
 
 --- Helper function to determine current file cache for deprioritization
