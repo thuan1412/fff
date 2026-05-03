@@ -123,6 +123,7 @@ https://github.com/user-attachments/assets/5d0e1ce9-642c-4c44-aa88-01b05bb86abb
   lazy = false, -- the plugin lazy-initialises itself
   keys = {
     { "ff", function() require('fff').find_files() end, desc = 'FFFind files' },
+    { "fr", function() require('fff').resume() end, desc = 'FFFind resume' },
     { "fg", function() require('fff').live_grep() end, desc = 'LiFFFe grep' },
     { "fz",
       function() require('fff').live_grep({ grep = { modes = { 'fuzzy', 'plain' } } }) end,
@@ -157,13 +158,17 @@ vim.g.fff = {
 }
 
 vim.keymap.set('n', 'ff', function() require('fff').find_files() end, { desc = 'FFFind files' })
+vim.keymap.set('n', 'fr', function() require('fff').resume() end, { desc = 'FFFind resume' })
 ```
 
 ### Public API
 
 ```lua
 require('fff').find_files()                        -- find files in current repo
+require('fff').find_files({ resume = true })       -- resume last find_files picker
 require('fff').live_grep()                         -- live content grep
+require('fff').live_grep({ resume = true })        -- resume last live_grep picker
+require('fff').resume()                            -- resume last closed picker (files or grep)
 require('fff').scan_files()                        -- force rescan
 require('fff').refresh_git_status()                -- refresh git status
 require('fff').find_files_in_dir(path)             -- find in a specific dir
@@ -172,6 +177,7 @@ require('fff').change_indexing_directory(new_path) -- change root
 
 ### Commands
 
+- `:FFFResume`. Resume the last closed picker (restores query, results, cursor, and mode).
 - `:FFFScan`. Rescan files.
 - `:FFFRefreshGit`. Refresh git status.
 - `:FFFClearCache [all|frecency|files]`. Clear caches.
