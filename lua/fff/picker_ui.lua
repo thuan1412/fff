@@ -2252,7 +2252,14 @@ function M.cycle_forward_query()
     -- Decrement offset to move forward toward more recent queries
     M.state.history_offset = M.state.history_offset - 1
   else
-    -- At the most recent entry (offset 0), can't go further forward
+    -- At the most recent entry (offset 0), clear query so user can type fresh
+    M.state.history_offset = nil
+    vim.api.nvim_buf_set_lines(M.state.input_buf, 0, -1, false, { M.state.config.prompt })
+    vim.schedule(function()
+      if M.state.active and M.state.input_win and vim.api.nvim_win_is_valid(M.state.input_win) then
+        vim.api.nvim_win_set_cursor(M.state.input_win, { 1, #M.state.config.prompt })
+      end
+    end)
     return
   end
 
