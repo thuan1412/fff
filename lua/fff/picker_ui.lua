@@ -2726,6 +2726,7 @@ end
 --- Falls back to opening a new find_files picker if nothing to resume.
 ---@param opts? table Optional config overrides for fallback open
 ---@return boolean
+function M.resume_find_files(opts)
   if M.state.active then
     vim.notify('FFF: close the current picker before resuming', vim.log.levels.INFO)
     return false
