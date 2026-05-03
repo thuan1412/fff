@@ -2636,9 +2636,7 @@ local function restore_from_state(state, source_label)
   M.state.selected_items = vim.deepcopy(state.selected_items or {})
 
   -- Restore the saved base_path for the indexer if it differs from the current CWD
-  if state.base_path then
-    M.change_indexing_directory(state.base_path)
-  end
+  if state.base_path then M.change_indexing_directory(state.base_path) end
 
   -- Merge saved config with current defaults (to pick up any user config changes since last close)
   local config = conf.get()
@@ -2702,8 +2700,7 @@ local function restore_from_state(state, source_label)
   return true
 end
 
---- Resume the most recently closed picker, regardless of mode.
----@return boolean true if a picker was resumed, false if there is nothing to resume
+---@return boolean true if a picker was resumed, false otherwise
 function M.resume()
   if M.state.active then
     vim.notify('FFF: close the current picker before resuming', vim.log.levels.INFO)
@@ -2718,12 +2715,8 @@ function M.resume()
   end
 
   -- Fallback: try grep state, then file state, then open an empty find_files picker
-  if last_grep_picker_state then
-    return restore_from_state(last_grep_picker_state, 'grep resume')
-  end
-  if last_file_picker_state then
-    return restore_from_state(last_file_picker_state, 'files resume')
-  end
+  if last_grep_picker_state then return restore_from_state(last_grep_picker_state, 'grep resume') end
+  if last_file_picker_state then return restore_from_state(last_file_picker_state, 'files resume') end
 
   -- Nothing saved: open an empty find_files picker
   return M.open()
@@ -2733,7 +2726,6 @@ end
 --- Falls back to opening a new find_files picker if nothing to resume.
 ---@param opts? table Optional config overrides for fallback open
 ---@return boolean
-function M.resume_find_files(opts)
   if M.state.active then
     vim.notify('FFF: close the current picker before resuming', vim.log.levels.INFO)
     return false
@@ -2858,9 +2850,7 @@ function M.close_windows()
   pcall(vim.api.nvim_del_augroup_by_name, 'fff_picker_focus')
 end
 
-function M.close()
-  save_state_and_close()
-end
+function M.close() save_state_and_close() end
 
 --- Helper function to determine current file cache for deprioritization
 --- @param base_path string|nil Base path for relative path calculation
@@ -3003,8 +2993,9 @@ end
 
 --- Open the file picker UI
 --- @param opts? {cwd?: string, title?: string, prompt?: string, max_results?: number, max_threads?: number, layout?: {width?: number|function, height?: number|function, prompt_position?: string|function, preview_position?: string|function, preview_size?: number|function}, renderer?: table, mode?: string, grep_config?: table, query?: string} Optional configuration to override defaults
+---@return boolean true if the picker was opened, false if it was already active or initialization failed
 function M.open(opts)
-  if M.state.active then return end
+  if M.state.active then return false end
 
   M.state.selected_files = {}
   M.state.selected_items = {}
@@ -3013,7 +3004,7 @@ function M.open(opts)
   M.state.grep_config = opts and opts.grep_config or nil
 
   local merged_config, base_path = initialize_picker(opts)
-  if not merged_config then return end
+  if not merged_config then return false end
 
   if base_path then M.change_indexing_directory(base_path) end
 

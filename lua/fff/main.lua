@@ -244,8 +244,6 @@ function M.resume()
   return picker_ui.resume()
 end
 
-
-
 --- Opens the file under the cursor with an optional callback if the only file
 --- is found and we are about to inline open it
 --- @param open_cb function|nil Optional callback function to execute after opening the file
