@@ -2613,29 +2613,11 @@ end
 local function save_state_and_close()
   if not M.state.active then return end
 
-  -- Build the state snapshot
-  local snapshot = {
-    config = M.state.config,
-    mode = M.state.mode,
-    renderer = M.state.renderer,
-    grep_config = M.state.grep_config,
-    grep_mode = M.state.grep_mode,
-    query = M.state.query or '',
-    current_file_cache = M.state.current_file_cache,
-    pagination = vim.deepcopy(M.state.pagination),
-    cursor = M.state.cursor,
-    location = vim.deepcopy(M.state.location),
-    items = vim.deepcopy(M.state.items),
-    filtered_items = vim.deepcopy(M.state.filtered_items),
-    combo_visible = M.state.combo_visible,
-    combo_initial_cursor = M.state.combo_initial_cursor,
-    suggestion_items = vim.deepcopy(M.state.suggestion_items),
-    suggestion_source = M.state.suggestion_source,
-    selected_files = vim.deepcopy(M.state.selected_files),
-    selected_items = vim.deepcopy(M.state.selected_items),
-  }
+  -- Deep copy the full state to capture all data fields automatically (future-proof).
+  -- Window/buffer handles are also copied but are ignored during restore since UI is recreated.
+  local snapshot = vim.deepcopy(M.state)
 
-  -- Get base path from the file picker or current config
+  -- Capture the base_path from the Rust file indexer (not part of M.state)
   local fuzzy = require('fff.core').ensure_initialized()
   local ok, base_path = pcall(fuzzy.get_base_path)
   if ok and base_path then
@@ -2680,14 +2662,8 @@ local function restore_from_state(state, source_label)
   -- Restore the saved base_path for the indexer if it differs from the current CWD
   if state.base_path then M.change_indexing_directory(state.base_path) end
 
-  -- Merge saved config with current defaults (to pick up any user config changes since last close)
-  local config = conf.get()
-  local merged_config = vim.tbl_deep_extend('force', config, {
-    renderer = state.renderer,
-    mode = state.mode,
-    grep_config = state.grep_config,
-  })
-  M.state.config = merged_config
+  -- Use the saved config directly to restore the exact picker state
+  M.state.config = state.config
 
   if not M.create_ui() then
     vim.notify('FFF: failed to create picker UI for ' .. source_label, vim.log.levels.ERROR)
@@ -2738,7 +2714,7 @@ local function restore_from_state(state, source_label)
     end
   end)
 
-  M.monitor_scan_progress(0)
+  -- Scan already completed when the original picker was open, no need to monitor again
   return true
 end
 
