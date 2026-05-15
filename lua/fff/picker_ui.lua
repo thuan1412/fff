@@ -2611,6 +2611,11 @@ end
 
 --- Save the current picker state for later resume, then close.
 local function save_state_and_close()
+  if M.state.query == '' then
+    -- Don't save empty state to avoid confusion on resume
+    M.close_windows()
+    return
+  end
   if not M.state.active then return end
 
   -- Deep copy the full state to capture all data fields automatically (future-proof).
