@@ -15,7 +15,6 @@ export function registerFileSearch(
     const quickPick = vscode.window.createQuickPick();
     quickPick.placeholder = "Search files by name...";
     quickPick.matchOnDescription = true;
-    quickPick.matchOnDetail = true;
     quickPick.items = [];
 
     let debounceTimer: ReturnType<typeof setTimeout> | undefined;
@@ -41,18 +40,11 @@ export function registerFileSearch(
           });
 
           const paths: string[] = [];
-          quickPick.items = results.items.map((item, i) => {
-            const dir = item.relativePath.includes("/")
-              ? item.relativePath.substring(0, item.relativePath.lastIndexOf("/"))
-              : "";
+          quickPick.items = results.items.map((item) => {
             paths.push(item.relativePath);
-
             return {
               label: item.fileName,
-              description: dir || undefined,
-              detail: item.gitStatus
-                ? `[${item.gitStatus.trim()}] ${item.relativePath}`
-                : item.relativePath,
+              description: item.relativePath,
               alwaysShow: true,
             };
           });
