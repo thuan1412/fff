@@ -1,5 +1,5 @@
 *fff.nvim.txt*
-                              For Neovim >= 0.10.0    Last change: 2026 May 04
+                             For Neovim >= 0.10.0    Last change: 2026 June 02
 
 ==============================================================================
 Table of Contents                                 *fff.nvim-table-of-contents*
@@ -524,7 +524,7 @@ query.
 
 Algorithm for fuzzy matching is much more comprehensive than fzf’s algorithm
 it is **typo-resistant** and we provide a query language with additional
-constraint parsing for prefiltering e.g. “.rs !test/ shcema” is a perfectly
+constraint parsing for prefiltering e.g. “.rs !/ shcema” is a perfectly
 valid query for fff, but fzf wouldn’t find anything even for a single typo in
 "shcema".
 
