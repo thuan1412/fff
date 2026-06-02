@@ -11,7 +11,7 @@ use crate::{
     constraints::apply_constraints,
     extract_bigrams,
     sort_buffer::sort_with_buffer,
-    types::{ContentCacheBudget, FileItem},
+    types::{ContentCacheBudget, FileItem, FileSliceExt, MmapSlot},
 };
 use aho_corasick::AhoCorasick;
 pub use fff_grep::{
@@ -333,6 +333,8 @@ pub struct GrepResult<'a> {
     pub regex_fallback_error: Option<String>,
 }
 
+pub use crate::constants::MAX_FFFILE_SIZE;
+
 /// Options for grep search.
 #[derive(Debug, Clone)]
 pub struct GrepSearchOptions {
@@ -371,7 +373,7 @@ pub struct GrepSearchOptions {
 impl Default for GrepSearchOptions {
     fn default() -> Self {
         Self {
-            max_file_size: 10 * 1024 * 1024,
+            max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 200,
             smart_case: true,
             file_offset: 0,
@@ -960,7 +962,7 @@ pub(crate) fn multi_grep_search<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
-    let total_files = files.len();
+    let total_files = files.live_count();
 
     if patterns.is_empty() || patterns.iter().all(|p| p.is_empty()) {
         return GrepResult {
@@ -1243,16 +1245,17 @@ where
     for chunk in files_to_search.chunks(chunk_size) {
         let chunk_offset = files_consumed;
 
-        // Parallel phase: search all files in this chunk concurrently.
-        // Within a chunk every file is visited (no gaps), so pagination
-        // offsets remain correct across chunk boundaries.
         let chunk_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = chunk
             .par_iter()
             .enumerate()
             .map_init(
-                // allocatge a single reusable buffer per thread
-                || Vec::with_capacity(64 * 1024),
-                |buf, (local_idx, file)| {
+                // Per-thread scratch: a reusable read buffer for small files
+                // and an mmap slot for cache-miss large files (≥ FRESH_MMAP_THRESHOLD).
+                || {
+                    tracing::info!("LMAOTHREAD");
+                    (Vec::with_capacity(64 * 1024), MmapSlot::default())
+                },
+                |(buf, mmap_slot), (local_idx, file)| {
                     if ctx.abort_signal.load(Ordering::Relaxed) {
                         budget_exceeded.store(true, Ordering::Relaxed);
                         return None;
@@ -1268,6 +1271,7 @@ where
 
                     let content = file.get_content_for_search(
                         buf,
+                        mmap_slot,
                         ctx.arena_for_file(file),
                         ctx.base_path,
                         ctx.budget,
@@ -1547,7 +1551,7 @@ fn fuzzy_grep_search<'a>(
     abort_signal: &AtomicBool,
     base_path: &Path,
     arena: crate::simd_path::ArenaPtr,
-    _overflow_arena: crate::simd_path::ArenaPtr,
+    overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
     // max_typos controls how many *needle* characters can be unmatched.
     // A transposition (e.g. "shcema" → "schema") costs ~1 typo with
@@ -1635,14 +1639,21 @@ fn fuzzy_grep_search<'a>(
     let budget_exceeded = AtomicBool::new(false);
     let max_matches_per_file = options.max_matches_per_file;
     // Parallel phase with `map_init`: each rayon worker thread clones the
-    // matcher once and gets a reusable read buffer. The buffer avoids
-    // mmap/munmap syscalls for non-cached files.
+    // matcher once and gets a reusable read buffer + mmap slot. Buffer holds
+    // small files, slot holds fresh mmap for cache-miss files
+    // ≥ FRESH_MMAP_THRESHOLD.
     let per_file_results: Vec<(usize, &'a FileItem, Vec<GrepMatch>)> = files_to_search
         .par_iter()
         .enumerate()
         .map_init(
-            || (matcher.clone(), Vec::with_capacity(64 * 1024)),
-            |(matcher, buf), (idx, file)| {
+            || {
+                (
+                    matcher.clone(),
+                    Vec::with_capacity(64 * 1024),
+                    MmapSlot::default(),
+                )
+            },
+            |(matcher, buf, mmap_slot), (idx, file)| {
                 if abort_signal.load(Ordering::Relaxed) {
                     budget_exceeded.store(true, Ordering::Relaxed);
                     return None;
@@ -1655,7 +1666,13 @@ fn fuzzy_grep_search<'a>(
                     return None;
                 }
 
-                let file_bytes = file.get_content_for_search(buf, arena, base_path, budget)?;
+                let file_arena = if file.is_overflow() {
+                    overflow_arena
+                } else {
+                    arena
+                };
+                let file_bytes =
+                    file.get_content_for_search(buf, mmap_slot, file_arena, base_path, budget)?;
 
                 // File-level prefilter: check if enough distinct needle chars
                 // exist anywhere in the file bytes.  Uses memchr for speed.
@@ -1859,7 +1876,7 @@ pub(crate) fn grep_search<'a>(
     arena: crate::simd_path::ArenaPtr,
     overflow_arena: crate::simd_path::ArenaPtr,
 ) -> GrepResult<'a> {
-    let total_files = files.len();
+    let total_files = files.live_count();
 
     // Extract the grep text and file constraints from the parsed query.
     // For grep, the search pattern is the original query with constraint tokens
@@ -2155,9 +2172,15 @@ pub(crate) fn grep_search<'a>(
                         return true;
                     }
 
-                    // we use ptr offsets to avoid additional allocations and keep the index
                     let file_idx =
                         unsafe { (*f as *const FileItem).offset_from(base_ptr) as usize };
+
+                    // Files past the bigram boundary (unindexable base files)
+                    // are not tracked by the bigram filter — always search them.
+                    if file_idx >= overflow_start {
+                        return true;
+                    }
+
                     BigramFilter::is_candidate(candidates, file_idx)
                 });
             }
@@ -2272,6 +2295,11 @@ fn strip_file_path_constraints<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use crate::bigram_filter::BigramIndexBuilder;
+    use crate::file_picker::{FilePicker, FilePickerOptions};
+    use std::io::Write;
+    use std::sync::atomic::AtomicBool;
 
     #[test]
     fn test_unescaped_newline_detection() {
@@ -2407,7 +2435,7 @@ mod tests {
         let arena = picker.arena_base_ptr();
 
         let options = super::GrepSearchOptions {
-            max_file_size: 10 * 1024 * 1024,
+            max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,
             smart_case: true,
             file_offset: 0,
@@ -2511,11 +2539,6 @@ mod tests {
     /// unconditionally appended by the overflow loop, producing duplicates.
     #[test]
     fn test_grep_no_duplicates_with_overflow_trailing_bits() {
-        use crate::bigram_filter::{BigramIndexBuilder, BigramOverlay};
-        use crate::file_picker::{FilePicker, FilePickerOptions};
-        use std::io::Write;
-        use std::sync::atomic::AtomicBool;
-
         let dir = tempfile::tempdir().unwrap();
         // Match the picker's internal dunce-canonicalize so paths passed to
         // on_create_or_modify resolve back to the same base_path on Windows.
@@ -2555,7 +2578,7 @@ mod tests {
         }
         let mut index = consec_builder.compress(Some(0));
         index.set_skip_index(skip_builder.compress(Some(0)));
-        picker.set_bigram_index(index, BigramOverlay::new(base_count));
+        picker.set_bigram_index(index);
 
         // Add three overflow files (new after the bigram index was built),
         // all containing "unicorn".
@@ -2564,7 +2587,7 @@ mod tests {
             let mut f = std::fs::File::create(&path).unwrap();
             writeln!(f, "overflow unicorn entry").unwrap();
             drop(f);
-            picker.on_create_or_modify(&path);
+            picker.handle_create_or_modify(&path);
         }
         assert_eq!(picker.get_files().len(), 8);
 
@@ -2596,7 +2619,7 @@ mod tests {
         // (a, b, c in base + f, g, h in overflow).
         let query = super::parse_grep_query("unicorn");
         let options = super::GrepSearchOptions {
-            max_file_size: 10 * 1024 * 1024,
+            max_file_size: MAX_FFFILE_SIZE,
             max_matches_per_file: 0,
             smart_case: true,
             file_offset: 0,

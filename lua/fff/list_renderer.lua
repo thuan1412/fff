@@ -1,17 +1,4 @@
---- List Renderer
---- Handles all list rendering: line generation, virtual rows, bottom padding,
---- buffer writes, cursor positioning, and highlight application.
----
---- Virtual rows (combo headers, grep file group headers) are decorations that
---- belong to buffer rendering, NOT to the data model. The cursor and selection
---- always operate on the items array (1-based indices), never on buffer lines.
----
---- Pagination is unaffected: Rust returns N items per page. The renderer may
---- produce N + K buffer lines (where K = number of virtual header rows), but
---- the page_size contract with Rust stays item-based.
----
---- Selection always operates on item.relative_path keys. Virtual rows have no identity
---- of their own — they derive from the item they belong to.
+--- List Renderer, renders any type of list results produced by fff
 local M = {}
 
 --- @class ListRenderContext
@@ -24,9 +11,6 @@ local M = {}
 --- @field debug_enabled boolean Whether debug mode shows scores
 --- @field prompt_position string 'top' or 'bottom'
 --- @field has_combo boolean Whether combo boost is active
---- @field combo_header_line string|nil Formatted combo header line
---- @field combo_header_text_len number|nil Length of combo header text
---- @field combo_item_index number|nil Index of item with combo (usually 1)
 --- @field display_start number Start index for displayed items (1)
 --- @field display_end number End index for displayed items (#items)
 --- @field iter_start number Iteration start
@@ -49,18 +33,23 @@ local M = {}
 --- @field item_to_lines table<number, ItemLineMapping> Maps item index -> line range
 --- @field padding_offset number Number of empty lines prepended for bottom prompt
 --- @field total_content_lines number Lines before padding was applied
+--- @field separator_line number|nil Buffer line (1-based) where separator sits, nil if none
 
---- Generate all display lines from items using the renderer.
---- Each item may produce 1 or more lines (virtual header + content).
---- When cross-mode suggestions are active, a suggestion banner is prepended
---- (for top prompt) or appended (for bottom prompt) so it always appears
---- above the suggestion items visually.
+--- @class ListSeparator
+--- @field idx number 1-based item index — separator visually sits between this item and the previous one in the iteration order
+--- @field text string Label text rendered inside the separator
+--- @field text_hl string|nil Highlight group for label
+--- @field border_hl string|nil Highlight group for the dashes
+
+--- Generate all display lines from items from the renderer ctx
 --- @param ctx table
 --- @return string[] lines Array of line strings
 --- @return table<number, ItemLineMapping> item_to_lines
+--- @return number|nil separator_line 1-based buffer line of the separator, nil if none
 local function generate_item_lines(ctx)
   local lines = {}
   local item_to_lines = {}
+  local separator_line = nil
 
   -- Cross-mode suggestion header: rendered above items visually.
   -- For top prompt that means before items; for bottom prompt after items
@@ -92,25 +81,39 @@ local function generate_item_lines(ctx)
   local renderer = ctx.renderer
   if not renderer then renderer = require('fff.file_renderer') end
 
+  -- Insert a gap on the side of the anchor away from the prompt.
+  -- Bottom prompt: gap BEFORE anchor in iter — anchor renders last with
+  -- reverse iter, so gap lands just above anchor visually.
+  -- Top prompt: gap AFTER anchor in iter — anchor renders first with
+  -- forward iter, so gap lands just below anchor visually.
+  -- Either way: anchor stays adjacent to the prompt, separator on far side.
+  local gap_before_anchor = ctx.prompt_position == 'bottom'
+
   for i = ctx.iter_start, ctx.iter_end, ctx.iter_step do
+    if ctx.separator and ctx.separator.idx == i and gap_before_anchor then
+      table.insert(lines, '')
+      separator_line = #lines
+    end
+
     local item = ctx.items[i]
     local item_start_line = #lines + 1
 
-    -- Renderer returns 1+ lines: virtual headers first, content line last.
-    -- This contract is shared by file_renderer (combo header) and
-    -- grep_renderer (file group header).
-    ---@diagnostic disable-next-line: param-type-mismatch
-    local item_lines = renderer.render_line(item, ctx, i)
+    local item_lines = renderer.render_line(item, ctx)
     vim.list_extend(lines, item_lines)
 
     local item_end_line = #lines
-    local virtual_count = item_end_line - item_start_line -- 0 if single line, 1 if header + content
+    local virtual_count = item_end_line - item_start_line
 
     item_to_lines[i] = {
       first = item_start_line,
       last = item_end_line,
       virtual_count = virtual_count,
     }
+
+    if ctx.separator and ctx.separator.idx == i and not gap_before_anchor then
+      table.insert(lines, '')
+      separator_line = #lines
+    end
   end
 
   -- For bottom prompt: suggestion header goes after items (appears above visually)
@@ -120,7 +123,7 @@ local function generate_item_lines(ctx)
     end
   end
 
-  return lines, item_to_lines
+  return lines, item_to_lines, separator_line
 end
 
 --- Apply bottom padding: prepend empty lines so content sits at the bottom.
@@ -128,29 +131,31 @@ end
 --- @param lines string[] Lines array (mutated)
 --- @param item_to_lines table<number, ItemLineMapping> Mapping (mutated)
 --- @param ctx table
+--- @param separator_line number|nil Pre-padding separator line (mutated via return value)
 --- @return number padding_offset Number of empty lines prepended
-local function apply_bottom_padding(lines, item_to_lines, ctx)
-  if ctx.prompt_position ~= 'bottom' then return 0 end
+--- @return number|nil shifted_separator_line
+local function apply_bottom_padding(lines, item_to_lines, ctx, separator_line)
+  if ctx.prompt_position ~= 'bottom' then return 0, separator_line end
 
   local total_content_lines = #lines
   local empty_lines_needed = math.max(0, ctx.win_height - total_content_lines)
 
   if empty_lines_needed > 0 then
-    -- Prepend empty lines
     for _ = empty_lines_needed, 1, -1 do
       table.insert(lines, 1, string.rep(' ', ctx.win_width + 5))
     end
 
-    -- Shift all line indices
     for i = ctx.display_start, ctx.display_end do
       if item_to_lines[i] then
         item_to_lines[i].first = item_to_lines[i].first + empty_lines_needed
         item_to_lines[i].last = item_to_lines[i].last + empty_lines_needed
       end
     end
+
+    if separator_line then separator_line = separator_line + empty_lines_needed end
   end
 
-  return empty_lines_needed
+  return empty_lines_needed, separator_line
 end
 
 --- Write lines to the buffer and position the cursor on the correct line.
@@ -218,11 +223,13 @@ end
 --- @param list_buf number List buffer handle
 --- @param list_win number List window handle
 --- @param ns_id number Highlight namespace
---- @return table<number, ItemLineMapping> item_to_lines for combo/scrollbar use
+--- @return table<number, ItemLineMapping> item_to_lines
+--- @return number|nil separator_line 1-based buffer line of the separator (post-padding), nil if none
 function M.render(ctx, list_buf, list_win, ns_id)
-  local lines, item_to_lines = generate_item_lines(ctx)
+  local lines, item_to_lines, separator_line = generate_item_lines(ctx)
 
-  apply_bottom_padding(lines, item_to_lines, ctx)
+  local _, shifted_separator_line = apply_bottom_padding(lines, item_to_lines, ctx, separator_line)
+  separator_line = shifted_separator_line
   update_buffer_and_cursor(lines, item_to_lines, ctx, list_buf, list_win, ns_id)
 
   if #ctx.items > 0 then apply_all_highlights(lines, item_to_lines, ctx, list_buf, ns_id) end
@@ -245,49 +252,7 @@ function M.render(ctx, list_buf, list_win, ns_id)
     end
   end
 
-  return item_to_lines
-end
-
---- Get the buffer line for an item's content (selectable) line.
---- Used by picker_ui for cursor positioning after navigation.
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return number|nil line 1-based buffer line, or nil if item not mapped
-function M.get_content_line(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return nil end
-  return mapping.last
-end
-
---- Get the buffer line for an item's first line (may be a virtual header).
---- Used by combo_renderer for overlay positioning.
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return number|nil line 1-based buffer line, or nil if item not mapped
-function M.get_first_line(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return nil end
-  return mapping.first
-end
-
---- Check if an item has virtual (header) rows.
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return boolean
-function M.has_virtual_rows(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return false end
-  return mapping.virtual_count > 0
-end
-
---- Count total buffer lines an item occupies (content + virtual).
---- @param item_to_lines table<number, ItemLineMapping>
---- @param item_index number 1-based item index
---- @return number
-function M.get_line_count(item_to_lines, item_index)
-  local mapping = item_to_lines[item_index]
-  if not mapping then return 0 end
-  return mapping.last - mapping.first + 1
+  return item_to_lines, separator_line
 end
 
 return M

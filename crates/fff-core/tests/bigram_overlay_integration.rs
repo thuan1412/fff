@@ -113,7 +113,7 @@ fn modified_file_findable_via_overlay() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        let result = picker.on_create_or_modify(&modified_path);
+        let result = picker.handle_create_or_modify(&modified_path);
         assert!(
             result.is_some(),
             "on_create_or_modify should return the file"
@@ -141,21 +141,6 @@ fn modified_file_findable_via_overlay() {
                 .iter()
                 .any(|m| m.line_content.contains("UNIQUE_NEEDLE")),
             "At least one match should contain UNIQUE_NEEDLE"
-        );
-    }
-
-    // Prove the overlay is actually doing something: without it, the bigram
-    // index would filter out beta.txt and the search would miss the needle.
-    {
-        let guard = shared_picker.read().unwrap();
-        let picker = guard.as_ref().unwrap();
-        let parsed = parse_grep_query("UNIQUE_NEEDLE");
-        let opts = grep_opts();
-        let result = picker.grep_original(&parsed, &opts);
-        assert_eq!(
-            result.matches.len(),
-            0,
-            "Without overlay, bigram prefiltering should exclude the modified file"
         );
     }
 
@@ -273,7 +258,7 @@ fn new_file_findable_after_add() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        let result = picker.on_create_or_modify(&new_path);
+        let result = picker.handle_create_or_modify(&new_path);
         assert!(
             result.is_some(),
             "on_create_or_modify should return the new file"
@@ -350,7 +335,7 @@ fn modified_file_findable_via_regex_overlay() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&modified_path).is_some());
+        assert!(picker.handle_create_or_modify(&modified_path).is_some());
     }
 
     // Regex grep should find the modified file through the overlay.

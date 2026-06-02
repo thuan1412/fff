@@ -140,12 +140,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "bindet"
-version = "0.3.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5afee99ef5f7527f3944f2bf4f5d443749fa47d43eb1d4f83a36e839be7900a3"
-
-[[package]]
 name = "bindgen"
 version = "0.70.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -475,6 +469,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "460fbee9c2c2f33933d720630a6a0bac33ba7053db5344fac858d4b8952d77d5"
 
 [[package]]
+name = "ctor"
+version = "0.2.9"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "32a2785755761f3ddc1492979ce1e48d2c00d09311c39e4466429188f3dd6501"
+dependencies = [
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "ctrlc"
 version = "3.5.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -629,20 +633,17 @@ checksum = "37909eebbb50d72f9059c3b6d82c0463f2ff062c9e95845c43a6c9c0355411be"
 
 [[package]]
 name = "fff-c"
-version = "0.7.0"
+version = "0.8.4"
 dependencies = [
  "fff-query-parser",
  "fff-search",
  "git2",
- "mimalloc",
- "serde",
  "serde_json",
- "tracing",
 ]
 
 [[package]]
 name = "fff-grep"
-version = "0.7.0"
+version = "0.8.4"
 dependencies = [
  "bstr",
  "memchr",
@@ -650,7 +651,7 @@ dependencies = [
 
 [[package]]
 name = "fff-mcp"
-version = "0.7.0"
+version = "0.8.4"
 dependencies = [
  "clap",
  "fff-query-parser",
@@ -667,9 +668,9 @@ dependencies = [
 
 [[package]]
 name = "fff-notify-debouncer-full"
-version = "0.9.3"
+version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5c6f0c16164d10c082af931377766f5495440bee66a9a841bbcea1af5de8878c"
+checksum = "29a4ebea7b8a2840cd59358bbf396f6f04313ce8eae84ac79703ce80298b8731"
 dependencies = [
  "file-id",
  "log",
@@ -681,41 +682,26 @@ dependencies = [
 
 [[package]]
 name = "fff-nvim"
-version = "0.7.0"
+version = "0.8.4"
 dependencies = [
  "ahash",
- "blake3",
  "chrono",
  "criterion",
  "ctrlc",
- "dirs",
- "fff-notify-debouncer-full",
  "fff-query-parser",
  "fff-search",
  "git2",
- "glidesort",
- "heed",
  "ignore",
  "mimalloc",
  "mlua",
- "neo_frizbee",
- "notify",
  "once_cell",
- "parking_lot",
- "pathdiff",
  "rand 0.8.5",
- "rayon",
- "serde",
- "smallvec",
- "smartstring",
- "tempfile",
- "thiserror 2.0.18",
  "tracing",
 ]
 
 [[package]]
 name = "fff-query-parser"
-version = "0.7.0"
+version = "0.8.4"
 dependencies = [
  "criterion",
  "zlob",
@@ -723,14 +709,13 @@ dependencies = [
 
 [[package]]
 name = "fff-search"
-version = "0.7.0"
+version = "0.8.4"
 dependencies = [
  "ahash",
  "aho-corasick",
- "bindet",
  "blake3",
- "chrono",
  "criterion",
+ "ctor",
  "dirs",
  "dunce",
  "fff-grep",
@@ -748,7 +733,6 @@ dependencies = [
  "mimalloc",
  "neo_frizbee",
  "notify",
- "once_cell",
  "parking_lot",
  "pathdiff",
  "proptest",
@@ -757,12 +741,9 @@ dependencies = [
  "regex",
  "regex-syntax",
  "serde",
- "serde_json",
  "smallvec",
- "smartstring",
  "tempfile",
  "thiserror 2.0.18",
- "toml",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1522,9 +1503,9 @@ dependencies = [
 
 [[package]]
 name = "neo_frizbee"
-version = "0.10.1"
+version = "0.10.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b216854d8c3752f8dbda56703c708de44bccb0542ca3924976c5977d6fb0724"
+checksum = "728e0731ad3a0083b9f72a82df72c298641ba970d4e308e0897ec4c89212c31d"
 dependencies = [
  "itertools 0.14.0",
  "raw-cpuid",
@@ -1554,9 +1535,9 @@ dependencies = [
 
 [[package]]
 name = "notify"
-version = "9.0.0-rc.3"
+version = "9.0.0-rc.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "783683ce6e1059e3747190a6c05688db21e07a846bf90babb351365f9133fe3e"
+checksum = "b44b771d4dd781ef14c84078693e67495da6b47f609f72e8a4da8420a861240e"
 dependencies = [
  "bitflags 2.11.0",
  "inotify",
@@ -2051,9 +2032,9 @@ checksum = "dc897dd8d9e8bd1ed8cdad82b5966c3e0ecae09fb1907d58efaa013543185d0a"
 
 [[package]]
 name = "rmcp"
-version = "1.2.0"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ba6b9d2f0efe2258b23767f1f9e0054cfbcac9c2d6f81a031214143096d7864f"
+checksum = "0810a9f717d9828f475fe1f629f4c305c8464b7f496c3a854b58d29e65f4058e"
 dependencies = [
  "async-trait",
  "base64",
@@ -2073,9 +2054,9 @@ dependencies = [
 
 [[package]]
 name = "rmcp-macros"
-version = "1.2.0"
+version = "1.7.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ab9d95d7ed26ad8306352b0d5f05b593222b272790564589790d210aa15caa9e"
+checksum = "6aefac48c364756e97f04c0401ba3231e8607882c7c1d92da0437dc16307904d"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -2228,15 +2209,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "serde_spanned"
-version = "0.6.9"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bf41e0cfaf7226dca15e8197172c295a782857fcb97fad1808a166870dee75a3"
-dependencies = [
- "serde",
-]
-
-[[package]]
 name = "sharded-slab"
 version = "0.1.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2280,18 +2252,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
-name = "smartstring"
-version = "1.0.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3fb72c633efbaa2dd666986505016c32c3044395ceaf881518399d2f4127ee29"
-dependencies = [
- "autocfg",
- "serde",
- "static_assertions",
- "version_check",
-]
-
-[[package]]
 name = "socket2"
 version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2306,12 +2266,6 @@ name = "stable_deref_trait"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6ce2be8dc25455e1f91df71bfa12ad37d7af1092ae736f3a6cd0e37bc7810596"
-
-[[package]]
-name = "static_assertions"
-version = "1.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "strsim"
@@ -2503,47 +2457,6 @@ dependencies = [
  "pin-project-lite",
  "tokio",
 ]
-
-[[package]]
-name = "toml"
-version = "0.8.23"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "dc1beb996b9d83529a9e75c17a1686767d148d70663143c7854d8b4a09ced362"
-dependencies = [
- "serde",
- "serde_spanned",
- "toml_datetime",
- "toml_edit",
-]
-
-[[package]]
-name = "toml_datetime"
-version = "0.6.11"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "22cddaf88f4fbc13c51aebbf5f8eceb5c7c5a9da2ac40a13519eb5b0a0e8f11c"
-dependencies = [
- "serde",
-]
-
-[[package]]
-name = "toml_edit"
-version = "0.22.27"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "41fe8c660ae4257887cf66394862d21dbca4a6ddd26f04a3560410406a2f819a"
-dependencies = [
- "indexmap",
- "serde",
- "serde_spanned",
- "toml_datetime",
- "toml_write",
- "winnow",
-]
-
-[[package]]
-name = "toml_write"
-version = "0.1.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5d99f8c9a7727884afe522e9bd5edbfc91a3312b36a77b5fb8926e4c31a41801"
 
 [[package]]
 name = "tracing"
@@ -2823,7 +2736,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3039,15 +2952,6 @@ name = "windows_x86_64_msvc"
 version = "0.53.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6bbff5f0aada427a1e5a6da5f1f98158182f26556f345ac9e04d36d0ebed650"
-
-[[package]]
-name = "winnow"
-version = "0.7.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "df79d97927682d2fd8adb29682d1140b343be4ac0f08fd68b7765d9c059d3945"
-dependencies = [
- "memchr",
-]
 
 [[package]]
 name = "wit-bindgen"

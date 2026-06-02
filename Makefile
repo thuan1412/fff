@@ -1,4 +1,5 @@
 PLENARY_DIR ?= ../plenary.nvim
+MINI_DIR ?= ../mini.nvim
 
 PREFIX ?= /usr/local
 LIBDIR ?= $(PREFIX)/lib
@@ -8,7 +9,12 @@ INCLUDEDIR ?= $(PREFIX)/include
 STRESS_RUSTFLAGS := --cfg stress
 FFF_STRESS_DEFAULT_SEED ?= 0xDEADBEEFCAFEBABE
 
-.PHONY: build build-c-lib install uninstall test test-rust test-lua test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random
+SHELL := bash
+# Order matters: `-c` must be last so bash treats the recipe as the script
+# string rather than the literal `-o` / `pipefail` tokens.
+.SHELLFLAGS := -o pipefail -ec
+
+.PHONY: build build-c-lib install uninstall test test-rust test-lua test-lua-snap test-version test-bun test-node prepare-bun prepare-node set-npm-version header test-stress test-stress-seeded test-stress-random test-stress-repos test-node-stress
 
 all: format test lint
 
@@ -54,13 +60,47 @@ test-setup:
 		echo "Cloning plenary.nvim..."; \
 		git clone --depth 1 https://github.com/nvim-lua/plenary.nvim $(PLENARY_DIR); \
 	fi
+	@if [ ! -d "$(MINI_DIR)" ]; then \
+		echo "Cloning mini.nvim..."; \
+		git clone --depth 1 https://github.com/echasnovski/mini.nvim $(MINI_DIR); \
+	fi
 
 test-rust:
 	cargo test --workspace --features zlob --exclude fff-nvim
 
+# neovim instance swallows internal crashes and doesn't rise the the error exiting silently
+# so check the stdout in case the sigsegv coming out of fff was printed (actual regression).
+# Output is streamed live via `tee`; pipefail (set above) propagates nvim's exit.
 test-lua: test-setup build
+	@logfile=$$(mktemp); \
+	trap 'rm -f "$$logfile"' EXIT; \
 	nvim --headless -u tests/minimal_init.lua \
-		-c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}" 2>&1
+		-c "PlenaryBustedDirectory tests/ {minimal_init = 'tests/minimal_init.lua'}" 2>&1 \
+		| tee "$$logfile"; \
+	if grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)" "$$logfile"; then \
+		echo ""; \
+		echo "FAIL: native crash detected during lua tests"; \
+		exit 1; \
+	fi
+
+# mini.test reference_screenshot snapshots. Separate runner because mini.test
+# spawns child processes and uses its own collector (incompatible with
+# PlenaryBustedDirectory). Streams output live via `tee` so failure diffs
+# appear as they happen instead of after a long capture-buffered silence.
+# `pcall` catches collect-time errors (e.g. parse error in the test file)
+# that would otherwise leave headless nvim hanging in its event loop because
+# the reporter's `cquit` never fires.
+test-lua-snap: test-setup build
+	@logfile=$$(mktemp); \
+	trap 'rm -f "$$logfile"' EXIT; \
+	nvim --headless -u tests/minimal_init.lua \
+		-c "lua local ok,err=pcall(require('mini.test').run_file,'tests/picker_ui_snap.lua'); if not ok then io.stderr:write('mini.test failed to load: '..tostring(err)..'\\n'); vim.cmd('cquit 2') end" 2>&1 \
+		| tee "$$logfile"; \
+	if grep -qE "SIG(SEGV|ABRT|BUS|FPE|ILL)" "$$logfile"; then \
+		echo ""; \
+		echo "FAIL: native crash detected during snapshot tests"; \
+		exit 1; \
+	fi
 
 test-version: test-setup
 	nvim --headless -u tests/minimal_init.lua \
@@ -68,17 +108,15 @@ test-version: test-setup
 
 prepare-bun: build
 	mkdir -p packages/fff-bun/bin
-	cp target/release/libfff_c.dylib packages/fff-bun/bin/ 2>/dev/null; \
-	cp target/release/libfff_c.so packages/fff-bun/bin/ 2>/dev/null; \
-	cp target/release/fff_c.dll packages/fff-bun/bin/ 2>/dev/null; \
-	true
+	cp target/release/libfff_c.dylib packages/fff-bun/bin/ 2>/dev/null || true; \
+	cp target/release/libfff_c.so packages/fff-bun/bin/ 2>/dev/null || true; \
+	cp target/release/fff_c.dll packages/fff-bun/bin/ 2>/dev/null || true
 
 prepare-node: build
 	mkdir -p packages/fff-node/bin
-	cp target/release/libfff_c.dylib packages/fff-node/bin/ 2>/dev/null; \
-	cp target/release/libfff_c.so packages/fff-node/bin/ 2>/dev/null; \
-	cp target/release/fff_c.dll packages/fff-node/bin/ 2>/dev/null; \
-	true
+	cp target/release/libfff_c.dylib packages/fff-node/bin/ 2>/dev/null || true; \
+	cp target/release/libfff_c.so packages/fff-node/bin/ 2>/dev/null || true; \
+	cp target/release/fff_c.dll packages/fff-node/bin/ 2>/dev/null || true
 
 test-bun: prepare-bun
 	cd packages/fff-bun && bun test src/
@@ -87,13 +125,19 @@ test-bun: prepare-bun
 test-node: prepare-node
 	cd packages/fff-node && npm run build && node test/e2e.mjs
 
-test: test-rust test-lua test-version test-bun test-node
+# Bug pinning stress test script over fff-node for issue #515
+# Just keep it untouched because it's good enough + some stress for SDK
+FFF_STRESS_ITERS ?= 50
+test-node-stress: prepare-node
+	cd packages/fff-node && npm run build && \
+		FFF_STRESS_ITERS=$(FFF_STRESS_ITERS) node test/stress-515.mjs
 
+test: test-rust test-lua test-lua-snap test-version test-bun test-node test-node-stress
 
 test-stress-seeded:
 	FFF_STRESS_SEED="$${FFF_STRESS_SEED:-$(FFF_STRESS_DEFAULT_SEED)}" \
 	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
-	cargo test \
+	cargo test --release \
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
 		--features zlob \
@@ -101,13 +145,21 @@ test-stress-seeded:
 
 test-stress-random:
 	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
-	cargo test \
+	cargo test --release \
 		-p fff-search \
 		--test fuzz_git_watcher_stress \
 		--features zlob \
 		-- --nocapture stress_random
 
-test-stress: test-stress-seeded test-stress-random
+test-stress-repos:
+	RUSTFLAGS="$(STRESS_RUSTFLAGS)" \
+	cargo test --release \
+		-p fff-search \
+		--test fuzz_real_repos \
+		--features zlob \
+		-- --nocapture
+
+test-stress: test-stress-seeded test-stress-random test-stress-repos
 
 # Update version in a package.json, including optionalDependencies.
 # Usage: make set-npm-version PKG=packages/fff-bun VERSION=1.0.0-nightly.abc1234

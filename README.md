@@ -23,11 +23,19 @@ Works with Claude Code, Codex, OpenCode, Cursor, Cline, and any MCP-capable clie
 
 ### One-line install
 
+Linux / macOS:
+
 ```bash
 curl -L https://dmtrkovalenko.dev/install-fff-mcp.sh | bash
 ```
 
-The script lives at [`install-mcp.sh`](./install-mcp.sh) if you want to read it first.
+Windows (PowerShell):
+
+```powershell
+irm https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.ps1 | iex
+```
+
+The scripts live at [`install-mcp.sh`](./install-mcp.sh) and [`install-mcp.ps1`](./install-mcp.ps1) if you want to read them first.
 
 It prints the exact wiring instructions for your client. Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
 
@@ -94,7 +102,7 @@ The Pi extension swaps pi's native tools for FFF implementations and feeds the i
 
 <details id="neovim-plugin">
 <summary>
-<h2>Neovim plugin</h2>
+<h2>fff.nvim</h2>
 </summary>
 
 Demo on the Linux kernel repo (100k files, 8GB):
@@ -173,7 +181,63 @@ require('fff').scan_files()                        -- force rescan
 require('fff').refresh_git_status()                -- refresh git status
 require('fff').find_files_in_dir(path)             -- find in a specific dir
 require('fff').change_indexing_directory(new_path) -- change root
+
+-- Programmatic search (no UI). Useful for plugin integrations.
+require('fff').file_search(query, opts)            -- fuzzy search files / dirs / mixed
+require('fff').content_search(query, opts)         -- programmatic grep
 ```
+
+#### `file_search(query, opts)`
+
+Returns a structured result `{ items, scores, total_matched, total_files?, total_dirs?, location? }`. Each item has a `type` field (`"file"` or `"directory"`) and `name` / `relative_path`. File items also expose `size`, `modified`, `git_status`, `is_binary`, and frecency scores.
+
+```lua
+local r = require('fff').file_search('button', {
+  mode             = 'mixed',  -- 'files' (default) | 'directories' | 'mixed'
+  max_results      = 50,
+  page             = 0,        -- 0-based pagination
+  current_file     = nil,      -- path to deprioritize for distance scoring
+  max_threads      = 4,
+  cwd              = nil,      -- switch indexed root if different (see below)
+  wait_for_index_ms = nil,     -- override the default scan wait timeout
+})
+for _, item in ipairs(r.items) do
+  print(item.type, item.relative_path)
+end
+```
+
+#### `content_search(query, opts)`
+
+Returns a `GrepResult` `{ items, total_matched, total_files_searched, total_files, filtered_file_count, next_file_offset, regex_fallback_error? }`. Each match item has `relative_path`, `name`, `line_number`, `col`, `line_content`, `match_ranges`, plus the same file metadata as `file_search`.
+
+```lua
+local r = require('fff').content_search('TODO', {
+  mode                  = 'plain',  -- 'plain' (default) | 'regex' | 'fuzzy'
+  max_file_size         = 10 * 1024 * 1024,
+  max_matches_per_file  = 100,
+  smart_case            = true,
+  page_size             = 50,
+  file_offset           = 0,
+  time_budget_ms        = 0,
+  trim_whitespace       = false,
+  cwd                   = nil,      -- switch indexed root if different
+  wait_for_index_ms     = nil,      -- override the default scan wait timeout
+})
+for _, m in ipairs(r.items) do
+  print(string.format('%s:%d %s', m.relative_path, m.line_number, m.line_content))
+end
+```
+
+Both functions accept the same constraint syntax as the UI pickers (e.g. `git:modified`, `*.rs`, `!test/`, glob patterns).
+
+#### `cwd` and indexing
+
+Both `file_search` and `content_search` honour an optional `cwd` field. The first call to either function lazily initialises the picker at `config.base_path` (your Neovim cwd by default).
+
+- If `cwd` matches the currently indexed root, the call returns immediately against the existing index.
+- If `cwd` differs, the picker is re-indexed at the new root and the call **blocks** (default up to 10 s) until the new picker is installed and its initial scan completes — so callers always get results from the right tree.
+- If the index is still warming up after a `change_indexing_directory`, you can pass `wait_for_index_ms = N` to block for up to `N` ms regardless of whether `cwd` triggered the swap. Pass `0` to skip waiting entirely (useful for fire-and-forget calls where partial results are acceptable).
+- Invalid or non-existent `cwd` paths return an empty result and emit an error via `vim.notify`.
 
 ### Commands
 
@@ -205,8 +269,9 @@ require('fff').setup({
     preview_position = 'right',   -- 'left' | 'right' | 'top' | 'bottom'
     preview_size = 0.5,
     flex = { size = 130, wrap = 'top' },
+    min_list_height = 10, --  do not display anything except the list below this threshold
     show_scrollbar = true,
-    path_shorten_strategy = 'middle_number', -- 'middle_number' | 'middle' | 'end'
+    path_shorten_strategy = 'middle_number', -- 'middle_number' | 'middle' | 'end' | 'start'
     anchor = 'center',
   },
   preview = {
@@ -262,8 +327,24 @@ require('fff').setup({
     time_budget_ms = 150,
     modes = { 'plain', 'regex', 'fuzzy' },
     trim_whitespace = false,
+    location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
-  debug = { enabled = false, show_scores = false },
+  debug = {
+    enabled = false, -- show the file info panel next to the preview
+    show_scores = false, -- inline scores in the file list
+    -- Per-section toggles for the file info panel. Accepts a boolean shorthand
+    -- (`show_file_info = true|false`) to flip everything at once. The panel
+    -- adapts to width: narrow renders sections vertically, wide renders them
+    -- as a two-column grid. Disable a section to also shrink the panel.
+    show_file_info = {
+      file_info = true, -- size, type, git status, frecency
+      score_breakdown = true, -- total + match type, bonuses, modifiers, penalty
+      -- modified + accessed timestamps; pass a table to hide individual rows:
+      --   timings = { modified = false, accessed = true }
+      timings = true,
+      full_path = true, -- relative path at the bottom (wraps if too long)
+    },
+  },
   logging = {
     enabled = true,
     log_file = vim.fn.stdpath('log') .. '/fff.log',
@@ -307,6 +388,51 @@ Mix freely: `git:modified src/**/*.rs !src/**/mod.rs user controller`.
 ### Git status highlighting
 
 Sign-column indicators are on by default. To color filename text by git status, set `git.status_text_color = true` and adjust the `hl.git_*` groups. See `:help fff.nvim` for the full list.
+
+### Float colors
+
+The picker maps its float content to `NormalFloat` (via `hl.normal`) and the border to `FloatBorder`. Default `FloatBorder` links to `NormalFloat`, so border and content share a background out of the box and the picker reads as a single popup. Override `hl.normal = 'Normal'` to make the picker blend with the editor instead.
+
+For finer control, set `hl.winhl` to override the per-window `winhighlight`. It accepts either a single string applied to every picker window, or a table with optional `prompt`, `list`, `preview`, and `file_info` keys. Missing keys fall back to the default built from `hl.normal`, `hl.border`, and `hl.title`.
+
+```lua
+-- Apply the same winhighlight to all picker windows
+hl = { winhl = 'Normal:NormalFloat,FloatBorder:FloatBorder,FloatTitle:Title' }
+
+-- Or override specific windows only
+hl = {
+  winhl = {
+    prompt  = 'Normal:Pmenu,FloatBorder:FloatBorder',
+    list    = 'Normal:NormalFloat,FloatBorder:FloatBorder',
+    preview = 'Normal:NormalFloat,FloatBorder:FloatBorder',
+  },
+}
+```
+
+### File info panel
+
+Enable with `debug.enabled = true`. The panel sits above the preview and shows
+file metadata, score breakdown, timestamps and the full absolute path. It
+adapts to the panel width: at narrow widths sections stack vertically (B2),
+at wide widths sections render as a two-column grid (H2). Each section can be
+disabled individually via `debug.show_file_info`.
+
+Customise the panel via `hl`:
+
+| key                          | default              | used for                            |
+| ---------------------------- | -------------------- | ----------------------------------- |
+| `file_info_section`          | `Title`              | section header label                |
+| `file_info_separator`        | `FloatBorder`        | dashes that act as section borders  |
+| `file_info_label`            | `Comment`            | row labels (Size, Type, Git, ...)   |
+| `file_info_value`            | `Normal` fg          | plain values                        |
+| `file_info_value_dim`        | `NonText`            | dim values, separators inside rows  |
+| `file_info_size`             | `Number`             | file size value                     |
+| `file_info_type`             | `Type`               | filetype value                      |
+| `file_info_path`             | `Directory`          | full path                           |
+| `file_info_total_score`      | bold + `Number`      | total score (bold)                  |
+| `file_info_match_type`       | bold + `Special`     | match type (bold)                   |
+| `file_info_score_pos`        | `DiagnosticOk`       | positive score components           |
+| `file_info_score_neg`        | `DiagnosticError`    | negative score components           |
 
 ### File filtering
 
@@ -493,7 +619,7 @@ Algorithm for fuzzy matching is much more comprehensive than fzf's algorithm it 
 ### What the core actually does
 
 - **Frecency-ranked fuzzy matching.** Every indexed file carries an access score and a modification score. Searches rank files you have opened recently and frequently above cold results. This is the same idea as VS Code's recently-opened list, but applied to every search result, not just a sidebar.
-- **Typo-resistant matching for both paths and content.** Smith-Waterman fuzzy scoring is available on the grep path; path search uses SIMD-accelerated fuzzy matching (via the [`frizbee`](https://github.com/saghm/frizbee)-derived core) that survives dropped characters and reorderings.
+- **Typo-resistant matching for both paths and content.** Smith-Waterman fuzzy scoring is available on the grep path; path search uses SIMD-accelerated fuzzy matching (via the [`frizbee`](https://github.com/saghen/frizbee)-derived core) that survives dropped characters and reorderings.
 - **Content grep with three modes.** Plain literal (SIMD memmem), regex (the Rust `regex` crate), and fuzzy (Smith-Waterman per line). Auto-detects which mode to use from the pattern, falls back to fuzzy when a plain search returns zero hits.
 - **Multi-pattern OR search.** SIMD Aho-Corasick for "find any of these 20 identifiers at once", which is faster than regex alternation and a lot faster than 20 separate ripgrep runs.
 - **Background file watcher.** The index updates as files change. You never pay for a rescan on the hot path.

@@ -6,9 +6,11 @@ local preview = require('fff.file_picker.preview')
 local utils = require('fff.utils')
 local location_utils = require('fff.location_utils')
 local combo_renderer = require('fff.combo_renderer')
+local list_separator = require('fff.list_separator')
 local list_renderer = require('fff.list_renderer')
 local scrollbar = require('fff.scrollbar')
 local rust = require('fff.rust')
+local layout = require('fff.layout')
 
 --- Saved state from the last closed file picker, used by resume().
 --- Populated in close() just before state is cleared.
@@ -544,9 +546,12 @@ function M.calculate_layout_dimensions(cfg)
 
   return layout
 end
+local canonicalize_fff_path = utils.canonicalize_fff_path
 
 local preview_config = conf.get().preview
 if preview_config then preview.setup(preview_config) end
+
+local function get_prompt_position() return layout.resolve_prompt_position(M.state.config) end
 
 local function suspend_paste()
   if not vim.o.paste then return false end
@@ -569,13 +574,14 @@ M.state = {
   file_info_buf = nil,
   preview_win = nil,
   preview_buf = nil,
+  preview_visible = false, -- True when preview window will be rendered (config + screen size)
 
   items = {},
   filtered_items = {},
   cursor = 1,
   top = 1,
   query = '',
-  item_line_map = {},
+  line_to_item = {},
   location = nil, -- Current location from search results
 
   -- History cycling state
@@ -641,6 +647,71 @@ M.state = {
   suggestion_source = nil,
 }
 
+function M.resolve_winhl(kind)
+  local hl = M.state.config.hl
+  local winhl = hl.winhl
+  local default_winhl = string.format('Normal:%s,FloatBorder:%s,FloatTitle:%s', hl.normal, hl.border, hl.title)
+
+  if winhl == nil then return default_winhl end
+  if type(winhl) == 'string' then return winhl end
+  if type(winhl) == 'table' then return winhl[kind] or default_winhl end
+  return default_winhl
+end
+
+local function open_preview(win_cfg)
+  if not win_cfg then return end
+  if M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win) then return end
+
+  if not (M.state.preview_buf and vim.api.nvim_buf_is_valid(M.state.preview_buf)) then
+    M.state.preview_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.preview_buf })
+    vim.api.nvim_buf_set_name(M.state.preview_buf, 'fffile preview')
+    vim.api.nvim_set_option_value('buftype', 'nofile', { buf = M.state.preview_buf })
+    vim.api.nvim_set_option_value('filetype', 'fff_preview', { buf = M.state.preview_buf })
+    vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.preview_buf })
+  end
+
+  M.state.preview_win = vim.api.nvim_open_win(M.state.preview_buf, false, win_cfg)
+
+  local win_hl = M.resolve_winhl('preview')
+
+  vim.api.nvim_set_option_value('wrap', false, { win = M.state.preview_win })
+  -- Match line is highlighted via extmark (line_hl_group + number_hl_group)
+  -- in location_utils, so the preview window itself keeps cursorline off.
+  -- This way paging with <C-d>/<C-u> moves the cursor freely without dragging
+  -- the highlight off the actual match line.
+  vim.api.nvim_set_option_value('cursorline', false, { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('cursorlineopt', vim.o.cursorlineopt, { win = M.state.preview_win })
+  vim.api.nvim_set_option_value(
+    'number',
+    M.state.mode == 'grep' or (preview_config and preview_config.line_numbers or false),
+    { win = M.state.preview_win }
+  )
+  vim.api.nvim_set_option_value('relativenumber', false, { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('signcolumn', 'no', { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.preview_win })
+  vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.preview_win })
+
+  preview.set_preview_window(M.state.preview_win)
+end
+
+--- Tear down the preview window and buffer. Called when the layout decides
+--- the preview no longer fits.
+local function close_preview()
+  if M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win) then
+    vim.api.nvim_win_close(M.state.preview_win, true)
+  end
+  M.state.preview_win = nil
+
+  if M.state.preview_buf and vim.api.nvim_buf_is_valid(M.state.preview_buf) then
+    preview.clear_buffer(M.state.preview_buf)
+    vim.api.nvim_buf_delete(M.state.preview_buf, { force = true })
+  end
+  M.state.preview_buf = nil
+  M.state.last_preview_file = nil
+  M.state.last_preview_location = nil
+end
+
 function M.create_ui()
   local config = M.state.config
   if not config then return false end
@@ -650,22 +721,21 @@ function M.create_ui()
 
   if not M.state.ns_id then
     M.state.ns_id = vim.api.nvim_create_namespace('fff_picker_status')
-    combo_renderer.init(M.state.ns_id)
+    list_separator.init(M.state.ns_id)
   end
 
-  local layout, debug_enabled_in_preview = compute_layout(config)
-  M.state.layout = layout
+  local computed_layout = layout.compute(config, conf.preview_enabled(config))
+  local win_configs = computed_layout.win_configs
+  local debug_enabled_in_preview = computed_layout.debug_enabled
+
+  M.state.layout = computed_layout.layout
+  M.state.preview_visible = computed_layout.preview_visible
 
   M.state.input_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.input_buf })
 
   M.state.list_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.list_buf })
-
-  if M.enabled_preview() then
-    M.state.preview_buf = vim.api.nvim_create_buf(false, true)
-    vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.preview_buf })
-  end
 
   if debug_enabled_in_preview then
     M.state.file_info_buf = vim.api.nvim_create_buf(false, true)
@@ -674,8 +744,6 @@ function M.create_ui()
     M.state.file_info_buf = nil
   end
 
-  local win_configs = build_window_configs(layout, config)
-
   M.state.list_win = vim.api.nvim_open_win(M.state.list_buf, false, win_configs.list)
   if debug_enabled_in_preview and win_configs.file_info then
     M.state.file_info_win = vim.api.nvim_open_win(M.state.file_info_buf, false, win_configs.file_info)
@@ -683,9 +751,7 @@ function M.create_ui()
     M.state.file_info_win = nil
   end
 
-  if M.enabled_preview() and win_configs.preview then
-    M.state.preview_win = vim.api.nvim_open_win(M.state.preview_buf, false, win_configs.preview)
-  end
+  if M.state.preview_visible then open_preview(win_configs.preview) end
 
   M.state.input_win = vim.api.nvim_open_win(M.state.input_buf, false, win_configs.input)
 
@@ -694,8 +760,6 @@ function M.create_ui()
   M.setup_keymaps()
 
   vim.api.nvim_set_current_win(M.state.input_win)
-
-  preview.set_preview_window(M.state.preview_win)
 
   M.update_results_sync()
   M.clear_preview()
@@ -707,7 +771,6 @@ end
 function M.setup_buffers()
   vim.api.nvim_buf_set_name(M.state.input_buf, 'fffile search')
   vim.api.nvim_buf_set_name(M.state.list_buf, 'fffiles list')
-  if M.enabled_preview() then vim.api.nvim_buf_set_name(M.state.preview_buf, 'fffile preview') end
 
   vim.api.nvim_set_option_value('buftype', 'prompt', { buf = M.state.input_buf })
   vim.api.nvim_set_option_value('filetype', 'fff_input', { buf = M.state.input_buf })
@@ -730,17 +793,12 @@ function M.setup_buffers()
     vim.api.nvim_set_option_value('filetype', 'fff_file_info', { buf = M.state.file_info_buf })
     vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.file_info_buf })
   end
-
-  if M.enabled_preview() then
-    vim.api.nvim_set_option_value('buftype', 'nofile', { buf = M.state.preview_buf })
-    vim.api.nvim_set_option_value('filetype', 'fff_preview', { buf = M.state.preview_buf })
-    vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.preview_buf })
-  end
 end
 
 function M.setup_windows()
-  local hl = M.state.config.hl
-  local win_hl = string.format('Normal:%s,FloatBorder:%s,FloatTitle:%s', hl.normal, hl.border, hl.title)
+  local prompt_win_hl = M.resolve_winhl('prompt')
+  local list_win_hl = M.resolve_winhl('list')
+  local file_info_win_hl = M.resolve_winhl('file_info')
 
   vim.api.nvim_set_option_value('wrap', false, { win = M.state.input_win })
   vim.api.nvim_set_option_value('cursorline', false, { win = M.state.input_win })
@@ -748,7 +806,7 @@ function M.setup_windows()
   vim.api.nvim_set_option_value('relativenumber', false, { win = M.state.input_win })
   vim.api.nvim_set_option_value('signcolumn', 'no', { win = M.state.input_win })
   vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.input_win })
-  vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.input_win })
+  vim.api.nvim_set_option_value('winhighlight', prompt_win_hl, { win = M.state.input_win })
 
   vim.api.nvim_set_option_value('wrap', false, { win = M.state.list_win })
   vim.api.nvim_set_option_value('cursorline', false, { win = M.state.list_win })
@@ -756,7 +814,7 @@ function M.setup_windows()
   vim.api.nvim_set_option_value('relativenumber', false, { win = M.state.list_win })
   vim.api.nvim_set_option_value('signcolumn', 'yes:1', { win = M.state.list_win }) -- Enable signcolumn for git status borders
   vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.list_win })
-  vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.list_win })
+  vim.api.nvim_set_option_value('winhighlight', list_win_hl, { win = M.state.list_win })
 
   if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) then
     vim.api.nvim_set_option_value('wrap', false, { win = M.state.file_info_win })
@@ -765,51 +823,7 @@ function M.setup_windows()
     vim.api.nvim_set_option_value('relativenumber', false, { win = M.state.file_info_win })
     vim.api.nvim_set_option_value('signcolumn', 'no', { win = M.state.file_info_win })
     vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.file_info_win })
-    vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.file_info_win })
-  end
-
-  if M.enabled_preview() then
-    vim.api.nvim_set_option_value('wrap', false, { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('cursorline', M.state.mode == 'grep', { win = M.state.preview_win })
-
-    local cursorlineopt = utils.resolve_config_value(
-      preview_config.cursorlineopt,
-      vim.o.columns,
-      vim.o.lines,
-      function(value)
-        if type(value) ~= 'string' or #value == 0 then return false end
-
-        local has_line = false
-        local has_screenline = false
-        for opt in value:gmatch('[^,]+') do
-          if not utils.is_one_of(opt:gsub('%s+', ''), { 'line', 'screenline', 'number', 'both' }) then return false end
-          if opt == 'line' or opt == 'both' then has_line = true end
-          if opt == 'screenline' then has_screenline = true end
-        end
-
-        if has_line and has_screenline then return false end
-
-        return true
-      end,
-      'both',
-      'preview.cursorlineopt'
-    )
-
-    vim.api.nvim_set_option_value(
-      'cursorlineopt',
-      M.state.mode == 'grep' and cursorlineopt or vim.o.cursorlineopt,
-      { win = M.state.preview_win }
-    )
-
-    vim.api.nvim_set_option_value(
-      'number',
-      M.state.mode == 'grep' or (preview_config and preview_config.line_numbers or false),
-      { win = M.state.preview_win }
-    )
-    vim.api.nvim_set_option_value('relativenumber', false, { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('signcolumn', 'no', { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('foldcolumn', '0', { win = M.state.preview_win })
-    vim.api.nvim_set_option_value('winhighlight', win_hl, { win = M.state.preview_win })
+    vim.api.nvim_set_option_value('winhighlight', file_info_win_hl, { win = M.state.file_info_win })
   end
 
   local picker_group = vim.api.nvim_create_augroup('fff_picker_focus', { clear = true })
@@ -899,14 +913,54 @@ function M.focus_preview_win()
   vim.api.nvim_set_current_win(M.state.preview_win)
 end
 
+local function handle_mouse_click_or_fallback(action, fallback)
+  local pos = vim.fn.getmousepos()
+
+  if M.state.active and pos.winid == M.state.list_win then
+    local item_idx = M.state.line_to_item[pos.line]
+    if not item_idx then return '' end
+
+    vim.schedule(function()
+      if not M.state.active then return end
+      if not M.state.filtered_items[item_idx] then return end
+
+      if M.state.cursor ~= item_idx then
+        M.state.cursor = item_idx
+        M.render_list()
+        if M.state.mode == 'grep' or M.state.suggestion_source == 'grep' then
+          M.update_preview_smart()
+        else
+          M.update_preview()
+        end
+        M.update_status()
+      end
+
+      if action then M.select(action) end
+    end)
+    return ''
+  end
+
+  return fallback
+end
+
 local function move_list_cursor(direction)
   if not M.state.active then return end
 
   local items = M.state.filtered_items
   if #items == 0 then return end
 
+  local wrap_around = M.state.config and M.state.config.wrap_around or false
   local new_cursor = M.state.cursor + direction
-  new_cursor = math.max(1, math.min(new_cursor, #items))
+
+  if wrap_around then
+    if new_cursor < 1 then
+      new_cursor = #items
+    elseif new_cursor > #items then
+      new_cursor = 1
+    end
+  else
+    new_cursor = math.max(1, math.min(new_cursor, #items))
+  end
 
   if new_cursor ~= M.state.cursor then
     M.state.cursor = new_cursor
@@ -946,6 +1000,7 @@ function M.setup_keymaps()
   set_keymap('i', keymaps.cycle_forward_query, M.cycle_forward_query, input_opts)
   set_keymap('n', 'j', M.move_down, input_opts)
   set_keymap('n', 'k', M.move_up, input_opts)
+  set_keymap('n', 'q', M.close, input_opts)
   set_keymap('n', keymaps.focus_list, M.focus_list_win, input_opts)
   set_keymap('n', keymaps.focus_preview, M.focus_preview_win, input_opts)
 
@@ -967,6 +1022,20 @@ function M.setup_keymaps()
   set_keymap({ 'i', 'n' }, keymaps.send_to_quickfix, M.send_to_quickfix, input_opts)
   set_keymap({ 'i', 'n' }, keymaps.cycle_grep_modes, M.cycle_grep_modes, input_opts)
 
+  local input_mouse_opts = vim.tbl_extend('force', input_opts, { expr = true, replace_keycodes = true })
+  set_keymap(
+    { 'i', 'n' },
+    '<LeftMouse>',
+    function() return handle_mouse_click_or_fallback(nil, '<LeftMouse>') end,
+    input_mouse_opts
+  )
+  set_keymap(
+    { 'i', 'n' },
+    '<2-LeftMouse>',
+    function() return handle_mouse_click_or_fallback('edit', '<2-LeftMouse>') end,
+    input_mouse_opts
+  )
+
   -- List buffer
   set_keymap('n', keymaps.close, M.close, list_opts)
   set_keymap('n', 'q', M.close, list_opts)
@@ -983,6 +1052,20 @@ function M.setup_keymaps()
   set_keymap('n', keymaps.toggle_debug, M.toggle_debug, list_opts)
   set_keymap('n', keymaps.toggle_select, M.toggle_select, list_opts)
   set_keymap('n', keymaps.send_to_quickfix, M.send_to_quickfix, list_opts)
+
+  local list_mouse_opts = vim.tbl_extend('force', list_opts, { expr = true, replace_keycodes = true })
+  set_keymap(
+    'n',
+    '<LeftMouse>',
+    function() return handle_mouse_click_or_fallback(nil, '<LeftMouse>') end,
+    list_mouse_opts
+  )
+  set_keymap(
+    'n',
+    '<2-LeftMouse>',
+    function() return handle_mouse_click_or_fallback('edit', '<2-LeftMouse>') end,
+    list_mouse_opts
+  )
 
   -- Preview buffer
   if M.state.preview_buf then
@@ -1431,7 +1514,7 @@ end
 --- Same-file location changes are instant; file changes are debounced
 --- to avoid visible preview flicker when scrolling rapidly through grep results.
 function M.update_preview_smart()
-  if not M.enabled_preview() then return end
+  if not M.state.preview_visible then return end
   if not M.state.active then return end
 
   local items = M.state.filtered_items
@@ -1529,6 +1612,8 @@ end
 --- Render the grep empty state: tips + bordered section of recent files.
 --- Called when grep mode has an empty query and no items.
 local function render_grep_empty_state(ctx)
+  list_separator.hide()
+
   local config = ctx.config
   local win_width = ctx.win_width
   local win_height = ctx.win_height
@@ -1632,31 +1717,50 @@ local function build_render_context()
 
   -- Combo detection (only in file picker mode with real results, not grep or suggestions)
   local combo_boost_score_multiplier = config.history and config.history.combo_boost_score_multiplier or 100
-  local has_combo, combo_header_line, combo_header_text_len, combo_item_index
-  if M.state.mode == 'grep' or M.state.suggestion_source then
-    has_combo = false
-    combo_header_line = nil
-    combo_header_text_len = nil
-    combo_item_index = nil
-  else
-    has_combo, combo_header_line, combo_header_text_len, combo_item_index = combo_renderer.detect_and_prepare(
+  local separator = nil
+  local combo_info = nil
+  if M.state.mode ~= 'grep' and not M.state.suggestion_source then
+    combo_info = combo_renderer.detect(
       items,
       file_picker,
-      win_width,
       combo_boost_score_multiplier,
       M.state.next_search_force_combo_boost or config.history.min_combo_count == 0
     )
   end
   M.state.next_search_force_combo_boost = false
 
-  if has_combo and not M.state.combo_visible then
-    has_combo = false
-    combo_item_index = nil
+  if combo_info and M.state.combo_visible then
+    -- Text is finalised in finalize_render once we know whether the
+    -- separator landed visually above or below the match (depends on iter
+    -- direction + which end of the iter the anchor sits on).
+    separator = {
+      idx = combo_info.idx,
+      text = combo_info.text,
+      text_hl = config.hl.combo_header,
+      border_hl = config.hl.border,
+    }
+    -- Track the actual anchor so the navigation hide-rule measures distance
+    -- from the real separator, not an assumed item-1 anchor.
+    M.state.combo_initial_cursor = combo_info.idx
   end
 
   -- Determine iteration order
   local display_start = 1
   local display_end = #items
+
+  -- Reserve one row for the separator gap when present. Without this, items
+  -- fill the list to the brim, the gap overflows the window, and the
+  -- separator float (positioned by buffer line) gets clipped or drawn on
+  -- top of the input border. Drop the item at the far end of the items
+  -- list, opposite the anchor — that's the row farthest from the prompt.
+  if separator and (display_end - display_start + 1) >= win_height then
+    if separator.idx == display_start then
+      display_end = display_end - 1
+    else
+      display_start = display_start + 1
+    end
+  end
+
   local iter_start, iter_end, iter_step
   if prompt_position == 'bottom' then
     iter_start, iter_end, iter_step = display_end, display_start, -1
@@ -1673,10 +1777,8 @@ local function build_render_context()
     max_path_width = text_width, -- Actual text area width (excluding signcolumn)
     debug_enabled = config and config.debug and config.debug.show_scores,
     prompt_position = prompt_position,
-    has_combo = has_combo,
-    combo_header_line = combo_header_line,
-    combo_header_text_len = combo_header_text_len,
-    combo_item_index = combo_item_index,
+    separator = separator,
+    combo_info = combo_info,
     display_start = display_start,
     display_end = display_end,
     iter_start = iter_start,
@@ -1692,27 +1794,28 @@ local function build_render_context()
   }
 end
 
-local function finalize_render(item_to_lines, ctx)
-  local combo_text_len = nil
-  if ctx.combo_item_index and item_to_lines[ctx.combo_item_index] then
-    combo_text_len = item_to_lines[ctx.combo_item_index].combo_header_text_len
+local function finalize_render(separator_line, ctx)
+  if ctx.separator and separator_line then
+    -- Arrow points toward the prompt: matches sit between the separator and
+    -- the prompt, so the arrow visually leads the eye from "rest of list"
+    -- through the separator toward the match + prompt.
+    local arrow = ctx.prompt_position == 'bottom' and '↓' or '↑'
+
+    local list_cfg = vim.api.nvim_win_get_config(M.state.list_win)
+    -- list_cfg.row is on the top border; content starts at list_cfg.row + 1.
+    -- separator_line is 1-based -> add directly.
+    local screen_row = list_cfg.row + separator_line
+
+    list_separator.update({
+      list_win = M.state.list_win,
+      row = screen_row,
+      text = arrow .. ' ' .. ctx.separator.text,
+      text_hl = ctx.separator.text_hl,
+      border_hl = ctx.separator.border_hl,
+    })
+  else
+    list_separator.hide()
   end
-
-  local combo_was_hidden = combo_renderer.render_highlights_and_overlays(
-    ctx.combo_item_index,
-    combo_text_len or ctx.combo_header_text_len,
-    M.state.list_buf,
-    M.state.list_win,
-    M.state.ns_id,
-    ctx.config.hl.border,
-    item_to_lines,
-    ctx.prompt_position,
-    #ctx.items
-  )
-
-  -- it's important part of functionality when user scrolls to the middle of the page we hide
-  -- the combo overlay which leaves the gap of the internal neovim buffer, so scroll to show last item
-  if combo_was_hidden and ctx.prompt_position == 'bottom' then scroll_to_bottom() end
 
   -- Scrollbar is only meaningful for file picker mode where total_matched is exact.
   -- Grep uses early termination so total_matched is approximate — scrollbar would be misleading.
@@ -1727,21 +1830,26 @@ function M.render_list()
 
   local ctx = build_render_context()
   if M.state.mode == 'grep' and #ctx.items == 0 then
+    M.state.line_to_item = {}
     render_grep_empty_state(ctx)
     return
   end
 
-  -- Delegate line generation, padding, buffer write, cursor, and highlights
-  -- to the list_renderer module. It returns the item_to_lines mapping needed
-  -- by finalize_render for combo overlays and scrollbar.
-  local item_to_lines = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
+  local item_to_lines, separator_line = list_renderer.render(ctx, M.state.list_buf, M.state.list_win, M.state.ns_id)
+
+  local line_to_item = {}
+  for item_idx, mapping in pairs(item_to_lines) do
+    for line = mapping.first, mapping.last do
+      line_to_item[line] = item_idx
+    end
+  end
+  M.state.line_to_item = line_to_item
 
   -- For bottom prompt, always ensure content is anchored at the bottom after rendering
   -- This prevents results from appearing in the middle when there are few items
   if ctx.prompt_position == 'bottom' then scroll_to_bottom() end
 
-  -- Finalize with combo overlays and scrollbar
-  finalize_render(item_to_lines, ctx)
+  finalize_render(separator_line, ctx)
 end
 
 --- Build and set the preview window title for a given item and location.
@@ -1817,7 +1925,7 @@ function M.update_preview_title(item, location)
 end
 
 function M.update_preview()
-  if not M.enabled_preview() then return end
+  if not M.state.preview_visible then return end
   if not M.state.active then return end
 
   local items = M.state.filtered_items
@@ -1897,16 +2005,22 @@ function M.update_preview()
 
   M.update_preview_title(item, effective_location)
 
-  if M.state.file_info_buf then preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor) end
+  if M.state.file_info_buf then
+    preview.update_file_info_buffer(item, M.state.file_info_buf, M.state.cursor, M.state.preview_win)
+    if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) then
+      local rel = item.relative_path or item.path or ''
+      pcall(vim.api.nvim_win_set_config, M.state.file_info_win, { title = ' ' .. rel .. ' ', title_pos = 'left' })
+    end
+  end
 
   preview.set_preview_window(M.state.preview_win)
-  preview.preview(resolve_item_path(item), M.state.preview_buf, effective_location, item.is_binary)
+  preview.preview(canonicalize_fff_path(item.relative_path), M.state.preview_buf, effective_location, item.is_binary)
 end
 
 --- Clear preview
 function M.clear_preview()
   if not M.state.active then return end
-  if not M.enabled_preview() then return end
+  if not M.state.preview_visible then return end
 
   vim.api.nvim_win_set_config(M.state.preview_win, {
     title = ' Preview ',
@@ -1915,19 +2029,9 @@ function M.clear_preview()
 
   if M.state.file_info_buf then
     vim.api.nvim_set_option_value('modifiable', true, { buf = M.state.file_info_buf })
-    vim.api.nvim_buf_set_lines(M.state.file_info_buf, 0, -1, false, {
-      'File Info Panel',
-      '',
-      'Select a file to view:',
-      '• Comprehensive scoring details',
-      '• File size and type information',
-      '• Git status integration',
-      '• Modification & access timings',
-      '• Frecency scoring breakdown',
-      '',
-      'Navigate: ↑↓ or Ctrl+p/n',
-    })
+    vim.api.nvim_buf_set_lines(M.state.file_info_buf, 0, -1, false, {})
     vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.file_info_buf })
+    pcall(vim.api.nvim_buf_clear_namespace, M.state.file_info_buf, preview.file_info_ns, 0, -1)
   end
 
   vim.api.nvim_set_option_value('modifiable', true, { buf = M.state.preview_buf })
@@ -1989,13 +2093,11 @@ function M.update_status(progress)
     local win_width = vim.api.nvim_win_get_width(M.state.input_win)
     local available_width = win_width - 2
 
-    local virt_text
     if fallback_label then
       local total_len = #fallback_label
       local col_position = available_width - total_len
-      virt_text = { { fallback_label, 'DiagnosticWarn' } }
       vim.api.nvim_buf_set_extmark(M.state.input_buf, M.state.ns_id, 0, 0, {
-        virt_text = virt_text,
+        virt_text = { { fallback_label, 'DiagnosticWarn' } },
         virt_text_win_col = col_position,
       })
     else
@@ -2040,12 +2142,81 @@ function M.update_status(progress)
   })
 end
 
+--- Wrap cursor to the first page, first item (best result)
+function M.wrap_to_first()
+  if M.state.pagination.page_index == 0 then
+    -- Already on first page, just move cursor
+    M.state.cursor = 1
+    return true
+  end
+
+  -- For non-grep mode, jump directly to page 0
+  if M.state.mode ~= 'grep' then
+    return M.load_page_at_index(0, function() M.state.cursor = 1 end)
+  end
+
+  -- For grep mode, we can only go back if page 0 offset is recorded
+  if M.state.pagination.grep_file_offsets[1] ~= nil then
+    return M.load_page_at_index(0, function() M.state.cursor = 1 end)
+  end
+
+  M.state.cursor = 1
+  return true
+end
+
+--- Wrap cursor to the last page, last item (worst result)
+function M.wrap_to_last()
+  local page_size = M.state.pagination.page_size
+  if page_size == 0 then return false end
+
+  if M.state.mode ~= 'grep' then
+    local total = M.state.pagination.total_matched
+    if total == 0 then return false end
+    local max_page_index = math.max(0, math.ceil(total / page_size) - 1)
+
+    if M.state.pagination.page_index == max_page_index then
+      -- Already on last page, just move cursor to last item
+      M.state.cursor = #M.state.filtered_items
+      return true
+    end
+
+    return M.load_page_at_index(max_page_index, function(result_count) M.state.cursor = result_count end)
+  end
+
+  -- For grep mode, we can't jump to last page (sequential offsets required)
+  -- Just wrap within current page
+  M.state.cursor = #M.state.filtered_items
+  return true
+end
+
+--- After cursor moves, decide whether the combo separator should hide.
+--- Hide rule: cursor has moved more than 50% of a page *past* the separator
+--- anchor (in the direction away from it). Direction-agnostic w.r.t. prompt
+--- position because we measure against the item index of the anchor, not its
+--- visual row.
+local function maybe_hide_combo_separator()
+  if not (M.state.combo_initial_cursor and M.state.combo_visible) then return end
+  local distance_past = M.state.cursor - M.state.combo_initial_cursor
+  -- Anchor at index 1 → "past" means cursor index grew. Anchor at #items
+  -- → "past" means cursor index shrank. Use absolute distance + a sign that
+  -- matches which side of the anchor the user crossed to.
+  if distance_past == 0 then return end
+  local half_page = math.floor(M.state.pagination.page_size * 0.5)
+  if math.abs(distance_past) <= half_page then return end
+
+  M.state.combo_visible = false
+  list_separator.hide()
+  M.render_list()
+  if get_prompt_position() == 'bottom' then scroll_to_bottom() end
+end
+
 function M.move_up()
   if not M.state.active then return end
   if #M.state.filtered_items == 0 then return end
 
   local prompt_position = get_prompt_position()
   local items_count = #M.state.filtered_items
+  local wrap_around = M.state.config and M.state.config.wrap_around or false
 
   -- Pagination logic depends on prompt position
   if prompt_position == 'bottom' then
@@ -2056,32 +2227,41 @@ function M.move_up()
 
     if near_bottom and at_last_item then
       local page_size = M.state.pagination.page_size
+      local has_more = false
       if page_size > 0 then
-        local has_more
         if M.state.mode == 'grep' then
           has_more = M.state.pagination.grep_next_file_offset > 0
         else
           local max_page = math.max(0, math.ceil(M.state.pagination.total_matched / page_size) - 1)
           has_more = M.state.pagination.page_index < max_page
         end
-        if has_more then
-          M.load_next_page()
-          return
-        end
       end
-    end
 
-    M.state.cursor = math.min(M.state.cursor + 1, items_count)
+      if has_more then
+        -- More pages available: paginate normally
+        M.load_next_page()
+        return
+      elseif wrap_around then
+        -- At global end (last item on last page): wrap to first
+        M.wrap_to_first()
+      end
+    else
+      M.state.cursor = math.min(M.state.cursor + 1, items_count)
+    end
   else
     -- Top prompt: scrolling UP means going to BETTER results (previous page)
     if M.state.cursor <= M.state.pagination.prefetch_margin + 1 and M.state.cursor <= 1 then
       if M.state.pagination.page_index > 0 then
+        -- More pages available: paginate normally
         vim.schedule(M.load_previous_page)
         return
+      elseif wrap_around then
+        -- At global start (first item on first page): wrap to last
+        M.wrap_to_last()
       end
+    else
+      M.state.cursor = math.max(M.state.cursor - 1, 1)
     end
-
-    M.state.cursor = math.max(M.state.cursor - 1, 1)
   end
 
   M.render_list()
@@ -2092,17 +2272,7 @@ function M.move_up()
   end
   M.update_status()
 
-  if M.state.combo_initial_cursor and M.state.combo_visible then
-    local cursor_distance = math.abs(M.state.cursor - M.state.combo_initial_cursor)
-    local half_page = math.floor(M.state.pagination.page_size / 2)
-    if cursor_distance > half_page then
-      M.state.combo_visible = false
-      combo_renderer.cleanup()
-      M.render_list() -- Re-render once without combo
-      -- Scroll to bottom for bottom prompt to eliminate gap
-      if get_prompt_position() == 'bottom' then scroll_to_bottom() end
-    end
-  end
+  maybe_hide_combo_separator()
 end
 
 function M.move_down()
@@ -2111,6 +2281,7 @@ function M.move_down()
 
   local prompt_position = get_prompt_position()
   local items_count = #M.state.filtered_items
+  local wrap_around = M.state.config and M.state.config.wrap_around or false
 
   -- Pagination logic depends on prompt position
   if prompt_position == 'bottom' then
@@ -2118,12 +2289,16 @@ function M.move_down()
     -- because lower index items (better) are rendered at higher line numbers
     if M.state.cursor <= M.state.pagination.prefetch_margin + 1 and M.state.cursor <= 1 then
       if M.state.pagination.page_index > 0 then
+        -- More pages available: paginate normally
         vim.schedule(M.load_previous_page)
         return
+      elseif wrap_around then
+        -- At global start (first item on first page): wrap to last
+        M.wrap_to_last()
       end
+    else
+      M.state.cursor = math.max(M.state.cursor - 1, 1)
     end
-
-    M.state.cursor = math.max(M.state.cursor - 1, 1)
   else
     -- Top prompt: scrolling DOWN means going to WORSE results (next page)
     local near_bottom = M.state.cursor >= (items_count - M.state.pagination.prefetch_margin)
@@ -2131,22 +2306,27 @@ function M.move_down()
 
     if near_bottom and at_last_item then
       local page_size = M.state.pagination.page_size
+      local has_more = false
       if page_size > 0 then
-        local has_more
         if M.state.mode == 'grep' then
           has_more = M.state.pagination.grep_next_file_offset > 0
         else
           local max_page = math.max(0, math.ceil(M.state.pagination.total_matched / page_size) - 1)
           has_more = M.state.pagination.page_index < max_page
         end
-        if has_more then
-          M.load_next_page()
-          return
-        end
       end
-    end
 
-    M.state.cursor = math.min(M.state.cursor + 1, items_count)
+      if has_more then
+        -- More pages available: paginate normally
+        M.load_next_page()
+        return
+      elseif wrap_around then
+        -- At global end (last item on last page): wrap to first
+        M.wrap_to_first()
+      end
+    else
+      M.state.cursor = math.min(M.state.cursor + 1, items_count)
+    end
   end
 
   M.render_list()
@@ -2157,17 +2337,7 @@ function M.move_down()
   end
   M.update_status()
 
-  if M.state.combo_initial_cursor and M.state.combo_visible then
-    local cursor_distance = math.abs(M.state.cursor - M.state.combo_initial_cursor)
-    local half_page = math.floor(M.state.pagination.page_size / 2)
-    if cursor_distance > half_page then
-      M.state.combo_visible = false
-      combo_renderer.cleanup()
-      M.render_list() -- Re-render once without combo
-      -- Scroll to bottom for bottom prompt to eliminate gap
-      if get_prompt_position() == 'bottom' then scroll_to_bottom() end
-    end
-  end
+  maybe_hide_combo_separator()
 end
 
 --- Scroll preview up by half window height
@@ -2282,48 +2452,18 @@ end
 
 --- Check whether the given window has 'winfixbuf' enabled.
 --- pcall-guarded so this stays safe on Neovim versions that predate the option.
---- @param win number Window ID
---- @return boolean
-local function window_has_winfixbuf(win)
-  local ok, val = pcall(vim.api.nvim_get_option_value, 'winfixbuf', { win = win })
-  return ok and val == true
-end
+local window_has_winfixbuf = utils.window_has_winfixbuf
 
---- Find the first visible window with a normal file buffer
+--- Find the first visible window with a normal file buffer, skipping the
+--- picker's own floats.
 --- @return number|nil Window ID of the first suitable window, or nil if none found
 local function find_suitable_window()
-  local current_tabpage = vim.api.nvim_get_current_tabpage()
-  local windows = vim.api.nvim_tabpage_list_wins(current_tabpage)
-
-  for _, win in ipairs(windows) do
-    if vim.api.nvim_win_is_valid(win) then
-      local buf = vim.api.nvim_win_get_buf(win)
-      if vim.api.nvim_buf_is_valid(buf) then
-        local buftype = vim.api.nvim_get_option_value('buftype', { buf = buf })
-        local modifiable = vim.api.nvim_get_option_value('modifiable', { buf = buf })
-        local filetype = vim.api.nvim_get_option_value('filetype', { buf = buf })
-
-        local is_picker_window = (
-          win == M.state.input_win
-          or win == M.state.list_win
-          or win == M.state.preview_win
-          or win == M.state.file_info_win
-        )
-
-        if
-          (buftype == '' or buftype == 'acwrite')
-          and modifiable
-          and not is_picker_window
-          and filetype ~= 'undotree'
-          and not window_has_winfixbuf(win)
-        then
-          return win
-        end
-      end
-    end
-  end
-
-  return nil
+  local exclude = {}
+  exclude[M.state.input_win or -1] = true
+  exclude[M.state.list_win or -1] = true
+  exclude[M.state.preview_win or -1] = true
+  exclude[M.state.file_info_win or -1] = true
+  return utils.find_suitable_window(exclude)
 end
 
 --- Build a unique key for a grep match occurrence.
@@ -2396,7 +2536,7 @@ function M.send_to_quickfix()
     if has_selections then
       -- Use explicitly selected items (survives page changes)
       for _, item in pairs(M.state.selected_items) do
-        local abs = resolve_item_path(item)
+        local abs = canonicalize_fff_path(item.relative_path)
         if abs then
           table.insert(qf_list, {
             filename = abs,
@@ -2419,7 +2559,7 @@ function M.send_to_quickfix()
       end
 
       for _, item in ipairs(all_items) do
-        local abs = resolve_item_path(item)
+        local abs = canonicalize_fff_path(item.relative_path)
         if abs then
           table.insert(qf_list, {
             filename = abs,
@@ -2442,7 +2582,7 @@ function M.send_to_quickfix()
       end
     else
       for _, item in ipairs(M.state.filtered_items) do
-        local abs = resolve_item_path(item)
+        local abs = canonicalize_fff_path(item.relative_path)
         if abs then table.insert(paths, abs) end
       end
     end
@@ -2489,7 +2629,7 @@ function M.select(action)
   -- Anchor against the indexer's base_path (may differ from cwd), then rephrase
   -- as cwd-relative for a nicer buffer name when possible. When outside cwd,
   -- fnamemodify(':.') leaves the absolute path intact.
-  local abs_path = resolve_item_path(item)
+  local abs_path = canonicalize_fff_path(item.relative_path)
   if not abs_path then return end
   local relative_path = vim.fn.fnamemodify(abs_path, ':.')
   local location = M.state.location -- Capture location before closing
@@ -2526,39 +2666,40 @@ function M.select(action)
   vim.cmd('stopinsert')
   M.close()
 
-  if action == 'edit' then
-    local current_win = vim.api.nvim_get_current_win()
-    local current_buf = vim.api.nvim_get_current_buf()
-    local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
-    local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
-    local current_winfixbuf = window_has_winfixbuf(current_win)
+  -- Defer file open past picker float teardown. Without this, foldexpr is not
+  -- recomputed on the new window (folds appear missing) on some platforms.
+  vim.schedule(function()
+    if action == 'edit' then
+      local current_win = vim.api.nvim_get_current_win()
+      local current_buf = vim.api.nvim_get_current_buf()
+      local current_buftype = vim.api.nvim_get_option_value('buftype', { buf = current_buf })
+      local current_buf_modifiable = vim.api.nvim_get_option_value('modifiable', { buf = current_buf })
+      local current_winfixbuf = window_has_winfixbuf(current_win)
 
-    -- If the current window can't host a new buffer (special buftype, non-modifiable,
-    -- or 'winfixbuf' locking it), retarget a suitable window or fall back to a split.
-    -- Without this, :edit raises E1513 ("Cannot switch buffer. 'winfixbuf' is enabled")
-    -- whenever the picker is invoked from a window pinned via :h winfixbuf.
-    local opened_via_split = false
-    if current_buftype ~= '' or not current_buf_modifiable or current_winfixbuf then
-      local suitable_win = find_suitable_window()
-      if suitable_win then
-        vim.api.nvim_set_current_win(suitable_win)
-      elseif current_winfixbuf then
-        vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-        opened_via_split = true
+      -- If the current window can't host a new buffer (special buftype, non-modifiable,
+      -- or 'winfixbuf' locking it), retarget a suitable window or fall back to a split.
+      -- Without this, :edit raises E1513 ("Cannot switch buffer. 'winfixbuf' is enabled")
+      -- whenever the picker is invoked from a window pinned via :h winfixbuf.
+      local opened_via_split = false
+      if current_buftype ~= '' or not current_buf_modifiable or current_winfixbuf then
+        local suitable_win = find_suitable_window()
+        if suitable_win then
+          vim.api.nvim_set_current_win(suitable_win)
+        elseif current_winfixbuf then
+          vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+          opened_via_split = true
+        end
       end
+
+      if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
+    elseif action == 'split' then
+      vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
+    elseif action == 'vsplit' then
+      vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
+    elseif action == 'tab' then
+      vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
     end
 
-    if not opened_via_split then vim.cmd('edit ' .. vim.fn.fnameescape(relative_path)) end
-  elseif action == 'split' then
-    vim.cmd('split ' .. vim.fn.fnameescape(relative_path))
-  elseif action == 'vsplit' then
-    vim.cmd('vsplit ' .. vim.fn.fnameescape(relative_path))
-  elseif action == 'tab' then
-    vim.cmd('tabedit ' .. vim.fn.fnameescape(relative_path))
-  end
-
-  -- Derive side effects on vim schedule to ensure they run after the file is opened
-  vim.schedule(function()
     if location then location_utils.jump_to_location(location) end
 
     if query and query ~= '' then
@@ -2582,10 +2723,10 @@ function M.relayout()
   local config = M.state.config
   if not config then return end
 
-  local layout, _ = compute_layout(config)
-  M.state.layout = layout
-
-  local win_configs = build_window_configs(layout, config)
+  local computed_layout = layout.compute(config, conf.preview_enabled(config))
+  local win_configs = computed_layout.win_configs
+  M.state.layout = computed_layout.layout
+  M.state.preview_visible = computed_layout.preview_visible
 
   if M.state.list_win and vim.api.nvim_win_is_valid(M.state.list_win) then
     vim.api.nvim_win_set_config(M.state.list_win, win_configs.list)
@@ -2595,12 +2736,41 @@ function M.relayout()
     vim.api.nvim_win_set_config(M.state.input_win, win_configs.input)
   end
 
-  if M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win) and win_configs.preview then
-    vim.api.nvim_win_set_config(M.state.preview_win, win_configs.preview)
+  -- Reconcile preview window with the new visibility decision. When the
+  -- terminal shrinks past the threshold we close it; when it grows back we
+  -- recreate it.
+  local preview_win_alive = M.state.preview_win and vim.api.nvim_win_is_valid(M.state.preview_win)
+  if M.state.preview_visible and win_configs.preview then
+    if preview_win_alive then
+      vim.api.nvim_win_set_config(M.state.preview_win, win_configs.preview)
+    else
+      open_preview(win_configs.preview)
+    end
+  elseif preview_win_alive then
+    close_preview()
   end
 
-  if M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win) and win_configs.file_info then
-    vim.api.nvim_win_set_config(M.state.file_info_win, win_configs.file_info)
+  -- File info panel piggybacks on the preview being side-by-side. Close it
+  -- when the new layout drops it; recreate it when the layout brings it back.
+  local file_info_win_alive = M.state.file_info_win and vim.api.nvim_win_is_valid(M.state.file_info_win)
+  if win_configs.file_info then
+    if file_info_win_alive then
+      vim.api.nvim_win_set_config(M.state.file_info_win, win_configs.file_info)
+    else
+      M.state.file_info_buf = vim.api.nvim_create_buf(false, true)
+      vim.api.nvim_set_option_value('bufhidden', 'wipe', { buf = M.state.file_info_buf })
+      vim.api.nvim_set_option_value('buftype', 'nofile', { buf = M.state.file_info_buf })
+      vim.api.nvim_set_option_value('filetype', 'fff_file_info', { buf = M.state.file_info_buf })
+      vim.api.nvim_set_option_value('modifiable', false, { buf = M.state.file_info_buf })
+      M.state.file_info_win = vim.api.nvim_open_win(M.state.file_info_buf, false, win_configs.file_info)
+    end
+  elseif file_info_win_alive then
+    vim.api.nvim_win_close(M.state.file_info_win, true)
+    M.state.file_info_win = nil
+    if M.state.file_info_buf and vim.api.nvim_buf_is_valid(M.state.file_info_buf) then
+      vim.api.nvim_buf_delete(M.state.file_info_buf, { force = true })
+    end
+    M.state.file_info_buf = nil
   end
 
   -- now rerenderw ith the new computed windows
@@ -2799,7 +2969,7 @@ function M.close_windows()
 
   restore_paste(M.state.restore_paste)
 
-  combo_renderer.cleanup()
+  list_separator.cleanup()
   scrollbar.cleanup()
 
   -- Clean up treesitter scratch buffers used for grep syntax highlighting
@@ -2823,7 +2993,7 @@ function M.close_windows()
     M.state.list_buf,
     M.state.file_info_buf,
   }
-  if M.enabled_preview() then buffers[#buffers + 1] = M.state.preview_buf end
+  if M.state.preview_buf then buffers[#buffers + 1] = M.state.preview_buf end
 
   for _, buf in ipairs(buffers) do
     if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -2849,6 +3019,7 @@ function M.close_windows()
   M.state.list_buf = nil
   M.state.file_info_buf = nil
   M.state.preview_buf = nil
+  M.state.preview_visible = false
   M.state.items = {}
   M.state.filtered_items = {}
   M.state.cursor = 1
@@ -2866,6 +3037,7 @@ function M.close_windows()
   M.state.grep_regex_fallback_error = nil
   M.state.suggestion_items = nil
   M.state.suggestion_source = nil
+  M.state.renderer = nil
   M.state.restore_paste = false
   M.state.combo_visible = true
   M.state.combo_initial_cursor = nil
@@ -2990,6 +3162,14 @@ end
 function M.open_with_callback(query, callback, opts)
   if M.state.active then return false end
 
+  -- open_with_callback runs the file-picker flow, never grep. Reset the
+  -- renderer/mode/grep_config defensively so we can't inherit stale state
+  -- from a previous live_grep session (close() must always do this too,
+  -- but belt-and-braces).
+  M.state.renderer = nil
+  M.state.mode = nil
+  M.state.grep_config = nil
+
   local merged_config, base_path = initialize_picker(opts)
   if not merged_config then return false end
 
@@ -3030,7 +3210,7 @@ function M.open(opts)
   local merged_config, base_path = initialize_picker(opts)
   if not merged_config then return false end
 
-  if base_path then M.change_indexing_directory(base_path) end
+  if base_path then require('fff.core').change_indexing_directory(base_path) end
 
   -- Initialize grep_mode to first configured mode when opening in grep mode
   if M.state.mode == 'grep' then
@@ -3047,34 +3227,6 @@ function M.open(opts)
   return open_ui_with_state(query, nil, nil, merged_config, current_file_cache)
 end
 
---- Change the base directory for the file picker
---- @param new_path string New directory path to use as base
---- @return boolean `true` if successful, `false` otherwise
-function M.change_indexing_directory(new_path)
-  if not new_path or new_path == '' then
-    vim.notify('Directory path is required', vim.log.levels.ERROR)
-    return false
-  end
-
-  local expanded_path = vim.fn.expand(new_path)
-
-  if vim.fn.isdirectory(expanded_path) ~= 1 then
-    vim.notify('Directory does not exist: ' .. expanded_path, vim.log.levels.ERROR)
-    return false
-  end
-
-  local fuzzy = require('fff.core').ensure_initialized()
-  local ok, result = pcall(fuzzy.restart_index_in_path, expanded_path)
-  if not ok then
-    vim.notify('Failed to change directory: ' .. result, vim.log.levels.ERROR)
-    return false
-  end
-
-  local config = require('fff.conf').get()
-  config.base_path = expanded_path
-  return true
-end
-
 function M.monitor_scan_progress(iteration)
   if not M.state.active then return end
 
@@ -3083,6 +3235,7 @@ function M.monitor_scan_progress(iteration)
   if progress.is_scanning then
     M.update_status(progress)
 
+    -- progressive decay for larger directories
     local timeout
     if iteration < 10 then
       timeout = 100
@@ -3096,15 +3249,6 @@ function M.monitor_scan_progress(iteration)
   else
     M.update_results()
   end
-end
-
-M.enabled_preview = function()
-  local preview_state = nil
-
-  if M and M.state and M.state.config then preview_state = M.state.config.preview end
-  if not preview_state then return true end
-
-  return preview_state.enabled
 end
 
 return M

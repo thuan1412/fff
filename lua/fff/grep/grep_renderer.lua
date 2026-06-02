@@ -14,10 +14,7 @@ local tresitter_highlight = require('fff.treesitter_hl')
 ---@param ctx table Render context
 ---@return string The header line string
 local function build_group_header(item, ctx)
-  ctx.has_combo = false
-  ---@diagnostic disable-next-line: param-type-mismatch
-  local lines = file_renderer.render_line(item, ctx, 0)
-  ctx.has_combo = false -- never has a combo in grep
+  local lines = file_renderer.render_line(item, ctx)
   return lines[1]
 end
 
@@ -44,13 +41,23 @@ end
 ---@param item table Grep match item
 ---@param ctx table Render context
 ---@return string The match line string
+local function format_location(item, ctx)
+  local fmt = (ctx.config and ctx.config.grep and ctx.config.grep.location_format) or ':%d:%d'
+  local ok, str = pcall(string.format, fmt, item.line_number or 0, (item.col or 0) + 1)
+  if not ok then str = string.format(':%d:%d', item.line_number or 0, (item.col or 0) + 1) end
+  return str
+end
+
+local BINARY_PLACEHOLDER = '<binary content>'
+
 local function render_match_line(item, ctx)
-  local location = string.format(':%d:%d', item.line_number or 0, (item.col or 0) + 1)
+  local location = format_location(item, ctx)
   local separator = '  '
   -- vim.json.decode may return Blobs for strings with NUL bytes; coerce to string.
   local raw_content = item.line_content
   if type(raw_content) ~= 'string' then raw_content = raw_content and tostring(raw_content) or '' end
   local content = raw_content
+  if item.is_binary_content then content = BINARY_PLACEHOLDER end
 
   -- Indent + location + separator + content
   local indent = ' '
@@ -108,7 +115,7 @@ local function apply_match_highlights(item, ctx, item_idx, buf, ns_id, row, line
   end
 
   -- 2. Location (:line:col) dimmed — use extmark with priority so it layers with cursor
-  local location_str = string.format(':%d:%d', item.line_number or 0, (item.col or 0) + 1)
+  local location_str = format_location(item, ctx)
   local loc_start = indent
   local loc_end = loc_start + #location_str
   if loc_end <= #line_content then
@@ -134,7 +141,17 @@ local function apply_match_highlights(item, ctx, item_idx, buf, ns_id, row, line
   -- Priority 120: above CursorLine (100) so syntax is visible on cursor line,
   -- below IncSearch match ranges (200) so search matches take precedence.
   local content_start = sep_end
-  if item._trimmed_content and item.name then
+
+  if item.is_binary_content then
+    local content_end = content_start + #BINARY_PLACEHOLDER
+    if content_end <= #line_content then
+      pcall(vim.api.nvim_buf_set_extmark, buf, ns_id, row, content_start, {
+        end_col = content_end,
+        hl_group = 'Comment',
+        priority = 150,
+      })
+    end
+  elseif item._trimmed_content and item.name then
     -- Resolve language once per file group (cache on the render context)
     ctx._ts_lang_cache = ctx._ts_lang_cache or {}
     local lang = ctx._ts_lang_cache[item.name]
@@ -162,7 +179,7 @@ local function apply_match_highlights(item, ctx, item_idx, buf, ns_id, row, line
   -- 5. Match ranges highlighted with IncSearch
   -- Use extmarks with priority > cursor line (100) so IncSearch renders
   -- properly on the selected line instead of being overridden by CursorLine.
-  if item.match_ranges then
+  if item.match_ranges and not item.is_binary_content then
     for _, range in ipairs(item.match_ranges) do
       local raw_start = range[1] or 0
       local raw_end = range[2] or 0
@@ -210,10 +227,12 @@ function M.render_line(item, ctx)
   local match_line = render_match_line(item, ctx)
 
   if is_new_group then
+    ---@diagnostic disable-next-line: inject-field
     item._has_group_header = true
     local header_line = build_group_header(item, ctx)
     return { header_line, match_line }
   else
+    ---@diagnostic disable-next-line: inject-field
     item._has_group_header = false
     return { match_line }
   end
@@ -237,6 +256,7 @@ function M.apply_highlights(item, ctx, item_idx, buf, ns_id, line_idx, line_cont
 
   -- If this item has a group header, highlight it (the line above)
   -- using file_renderer for identical appearance to the file picker list.
+  ---@diagnostic disable-next-line: undefined-field
   if item._has_group_header then apply_group_header_highlights(item, ctx, buf, ns_id, row - 1) end
 end
 

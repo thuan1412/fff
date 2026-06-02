@@ -84,7 +84,7 @@ fn bigram_overlay_coherence_stress_base_edits_and_deletes() {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
                 assert!(
-                    picker.on_create_or_modify(base.join(name)).is_some(),
+                    picker.handle_create_or_modify(base.join(name)).is_some(),
                     "round {round}: modify({name}) should succeed"
                 );
             }
@@ -148,7 +148,7 @@ fn bigram_overlay_coherence_long_session_incremental_edits() {
             {
                 let mut guard = shared_picker.write().unwrap();
                 let picker = guard.as_mut().unwrap();
-                picker.on_create_or_modify(base.join(name));
+                picker.handle_create_or_modify(base.join(name));
             }
             latest_tokens[file_idx] = new_token;
         }
@@ -225,7 +225,7 @@ fn bigram_overlay_coherence_resurrect_tombstoned_file() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&target_path).is_some());
+        assert!(picker.handle_create_or_modify(&target_path).is_some());
     }
 
     {
@@ -275,7 +275,7 @@ fn bigram_overlay_coherence_proves_contribution_for_modified_base() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(&target_path);
+        picker.handle_create_or_modify(&target_path);
     }
 
     {
@@ -284,12 +284,6 @@ fn bigram_overlay_coherence_proves_contribution_for_modified_base() {
 
         let with_overlay = grep_count(picker, unique);
         assert_eq!(with_overlay, 1, "overlay should find the new token");
-
-        let without_overlay = grep_without_overlay_count(picker, unique);
-        assert_eq!(
-            without_overlay, 0,
-            "without overlay, bigram should exclude the file (stale bigrams)"
-        );
     }
 
     stop_picker(&shared_picker);
@@ -333,7 +327,7 @@ fn bigram_overlay_coherence_rapid_create_delete_same_base_path() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(&volatile_path);
+            picker.handle_create_or_modify(&volatile_path);
         }
 
         {
@@ -376,7 +370,7 @@ fn bigram_overlay_coherence_rapid_create_delete_same_base_path() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(&volatile_path);
+            picker.handle_create_or_modify(&volatile_path);
         }
     }
 
@@ -434,7 +428,7 @@ fn bigram_overlay_coherence_overflow_files_searchable_via_grep() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&new_path).is_some());
+        assert!(picker.handle_create_or_modify(&new_path).is_some());
     }
 
     // Overflow file is tracked.
@@ -499,7 +493,7 @@ fn bigram_overlay_coherence_mixed_tombstones_and_overflow() {
         write_file_with_token(base, &name, &token);
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join(&name));
+        picker.handle_create_or_modify(base.join(&name));
         new_tokens.push(token);
     }
 
@@ -573,7 +567,7 @@ fn bigram_overlay_coherence_full_stress_loop_with_overflow() {
             write_file_with_token(base, name, &new_token);
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
             dead_tokens.push(old_token.clone());
             *old_token = new_token;
         }
@@ -585,7 +579,7 @@ fn bigram_overlay_coherence_full_stress_loop_with_overflow() {
             write_file_with_token(base, &name, &token);
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(&name));
+            picker.handle_create_or_modify(base.join(&name));
             live_overflow.push((name, token));
         }
 
@@ -648,7 +642,7 @@ fn bigram_overlay_coherence_overflow_file_edit_and_delete() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(&path);
+            picker.handle_create_or_modify(&path);
         }
         overflow_files.push((path, token));
     }
@@ -673,7 +667,7 @@ fn bigram_overlay_coherence_overflow_file_edit_and_delete() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(path);
+            picker.handle_create_or_modify(path);
         }
         edited_tokens.push(new_token);
     }
@@ -689,14 +683,19 @@ fn bigram_overlay_coherence_overflow_file_edit_and_delete() {
         }
     }
 
-    // Verify 5 overflow remain.
+    // Verify 5 overflow remain live (tombstones still occupy slots by design —
+    // StableVec never shifts, so get_overflow_files().len() stays at 10).
     {
         let guard = shared_picker.read().unwrap();
         let picker = guard.as_ref().unwrap();
+        let live = picker
+            .get_overflow_files()
+            .iter()
+            .filter(|f| !f.is_deleted())
+            .count();
         assert_eq!(
-            picker.get_overflow_files().len(),
-            5,
-            "should have 5 overflow files after deleting 5"
+            live, 5,
+            "should have 5 live overflow files after deleting 5"
         );
     }
 
@@ -737,7 +736,7 @@ fn bigram_overlay_coherence_rescan_after_git_commit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         edited_tokens.push(token);
     }
@@ -750,7 +749,7 @@ fn bigram_overlay_coherence_rescan_after_git_commit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(&name));
+            picker.handle_create_or_modify(base.join(&name));
         }
         new_tokens.push(token);
     }
@@ -801,14 +800,6 @@ fn bigram_overlay_coherence_rescan_after_git_commit() {
                 with >= 1,
                 "post-rescan: edited token {token} should be findable"
             );
-
-            // The content is now in the base index, so it should be
-            // findable even without the overlay.
-            let without = grep_without_overlay_count(picker, token);
-            assert!(
-                without >= 1,
-                "post-rescan: {token} should be in base index (without overlay: {without})"
-            );
         }
 
         for token in &new_tokens {
@@ -851,7 +842,7 @@ fn bigram_overlay_coherence_full_lifecycle_seed_edit_commit_rescan_edit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         phase1_tokens.push(token);
     }
@@ -930,7 +921,7 @@ fn bigram_overlay_coherence_full_lifecycle_seed_edit_commit_rescan_edit() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         phase3_tokens.push(token);
     }
@@ -1009,7 +1000,7 @@ fn bigram_overlay_coherence_nested_directory_edits() {
         {
             let mut guard = shared_picker.write().unwrap();
             let picker = guard.as_mut().unwrap();
-            picker.on_create_or_modify(base.join(name));
+            picker.handle_create_or_modify(base.join(name));
         }
         edited.push(token);
     }
@@ -1127,7 +1118,7 @@ fn bigram_overlay_coherence_fuzzy_search_base_overflow_and_deleted() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join("controller_admin.rs"));
+        picker.handle_create_or_modify(base.join("controller_admin.rs"));
     }
 
     // Fuzzy search should find the new overflow file.
@@ -1174,7 +1165,7 @@ fn bigram_overlay_coherence_fuzzy_search_after_rescan() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join("router_grpc.rs"));
+        picker.handle_create_or_modify(base.join("router_grpc.rs"));
     }
 
     let web_path = base.join("router_web.rs");
@@ -1239,7 +1230,7 @@ fn bigram_overlay_coherence_fuzzy_and_grep_combined() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join(edit_name));
+        picker.handle_create_or_modify(base.join(edit_name));
     }
 
     // Add an overflow file with a distinctive name.
@@ -1251,7 +1242,7 @@ fn bigram_overlay_coherence_fuzzy_and_grep_combined() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        picker.on_create_or_modify(base.join("unique_overflow_widget.rs"));
+        picker.handle_create_or_modify(base.join("unique_overflow_widget.rs"));
     }
 
     // Delete a base file.
@@ -1332,11 +1323,6 @@ fn grep_opts() -> GrepSearchOptions {
 fn grep_count(picker: &FilePicker, query: &str) -> usize {
     let parsed = parse_grep_query(query);
     picker.grep(&parsed, &grep_opts()).matches.len()
-}
-
-fn grep_without_overlay_count(picker: &FilePicker, query: &str) -> usize {
-    let parsed = parse_grep_query(query);
-    picker.grep_original(&parsed, &grep_opts()).matches.len()
 }
 
 /// Wait for scanning to finish (no bigram requirement).
@@ -1635,7 +1621,7 @@ fn bigram_overlay_coherence_fuzzy_grep_finds_overflow_files() {
     {
         let mut guard = shared_picker.write().unwrap();
         let picker = guard.as_mut().unwrap();
-        assert!(picker.on_create_or_modify(&new_path).is_some());
+        assert!(picker.handle_create_or_modify(&new_path).is_some());
         assert_eq!(picker.get_overflow_files().len(), 1);
     }
 

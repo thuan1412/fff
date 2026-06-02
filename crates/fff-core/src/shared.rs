@@ -2,6 +2,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard, Weak};
 use std::time::{Duration, Instant};
 
+use crate::dbs::lmdb::spawn_lmdb_gc;
 use crate::error::Error;
 use crate::file_picker::FilePicker;
 use crate::frecency::FrecencyTracker;
@@ -155,18 +156,44 @@ impl SharedFilePicker {
         true
     }
 
+    /// Blocks until both the filesystem walk and post-scan indexing are done.
+    /// Returns true once scanning=false AND post_scan_indexing_active=false.
+    pub fn wait_for_indexing_complete(&self, timeout: Duration) -> bool {
+        let (scanning, post_scan_active) = {
+            let guard = self.0.picker.read();
+            match &*guard {
+                Some(picker) => (
+                    Arc::clone(&picker.signals.scanning),
+                    Arc::clone(&picker.signals.post_scan_indexing_active),
+                ),
+                None => return true,
+            }
+        };
+
+        let start = std::time::Instant::now();
+        loop {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            let s = scanning.load(std::sync::atomic::Ordering::Acquire);
+            let p = post_scan_active.load(std::sync::atomic::Ordering::Acquire);
+            if !s && !p {
+                return true;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Trigger a full filesystem rescan without blocking the caller.
     /// Performs a safe async rescan. Guarantees only single active rescan per picker.
     /// If many rescans requested the last one guaranteed to be finished.
     pub fn trigger_full_rescan_async(&self, shared_frecency: &SharedFrecency) -> Result<(), Error> {
-        match ScanJob::new(self, shared_frecency, /*install_watcher=*/ false)? {
+        match ScanJob::new_rescan(self, shared_frecency)? {
             Some(job) => {
                 job.spawn();
             }
             None => {
-                // A scan is already in flight — mark a follow-up as
-                // needed. The running scan's `run()` drains this flag
-                // and reschedules itself.
+                // we can not abort the ongoing sync, but if the events
                 if let Ok(guard) = self.read()
                     && let Some(picker) = guard.as_ref()
                 {
@@ -194,25 +221,18 @@ impl SharedFilePicker {
                 return Err(Error::FilePickerMissing);
             };
 
-            debug!(
-                "Refreshing git statuses for picker: {:?}",
-                picker.git_root()
-            );
+            let git_root = picker.git_root().map(|p| p.to_path_buf());
+            drop(guard); // updating git status could take very long time, there is not risky as we
+            // do not allow any mutations and deletions of files from the sync
 
-            // Wait briefly for any in-progress git operation to release
-            // its `.git/index.lock`. libgit2 reads `.git/index` directly
-            // and does NOT coordinate with the filesystem lock; if a
-            // writer is mid-atomic-rename (lock file exists, new index
-            // not yet swapped in), we would observe stale status data.
-            // This matters most for the background watcher, which
-            // typically fires refresh in response to the very events
-            // produced by that in-flight git write.
-            if let Some(root) = picker.git_root() {
+            debug!(?git_root, "Refreshing git status for picker");
+
+            if let Some(ref root) = git_root {
                 wait_for_git_index_lock_release(root);
             }
 
             GitStatusCache::read_git_status(
-                picker.git_root(),
+                git_root.as_deref(),
                 &mut crate::git::default_status_options(),
             )
         };
@@ -271,19 +291,20 @@ impl SharedFrecency {
         self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the frecency tracker. No-op if this is a disabled instance.
     pub fn init(&self, tracker: FrecencyTracker) -> Result<(), Error> {
         if !self.enabled {
             return Ok(());
         }
-        let mut guard = self.write()?;
-        *guard = Some(tracker);
-        Ok(())
-    }
 
-    /// Spawn a background GC thread for this frecency tracker.
-    pub fn spawn_gc(&self, db_path: String) -> crate::Result<std::thread::JoinHandle<()>> {
-        FrecencyTracker::spawn_gc(self.clone(), db_path)
+        {
+            let mut guard = self.write()?;
+            *guard = Some(tracker);
+        }
+
+        // GC holds a read guard on this lock, so destroy / re-init wait
+        // for it naturally — no join handle, no race against file removal.
+        spawn_lmdb_gc(self.inner.clone());
+        Ok(())
     }
 
     /// Drop the in-memory tracker and delete the on-disk database directory.
@@ -350,17 +371,22 @@ impl SharedQueryTracker {
         self.inner.write().map_err(|_| Error::AcquireFrecencyLock)
     }
 
-    /// Initialize the query tracker. No-op if this is a disabled instance.
+    /// Initialize the query tracker + spawn GC in the background.
+    /// No-op if this is a disabled instance.
     pub fn init(&self, tracker: QueryTracker) -> Result<(), Error> {
         if !self.enabled {
             return Ok(());
         }
-        let mut guard = self.write()?;
-        *guard = Some(tracker);
+        {
+            let mut guard = self.write()?;
+            *guard = Some(tracker);
+        }
+
+        spawn_lmdb_gc(self.inner.clone());
         Ok(())
     }
 
-    /// Drop the in-memory tracker and delete the on-disk database directory.
+    ///Drop the in-memory tracker and delete the on-disk database directory.
     ///
     /// Acquires the write lock, ensuring all readers (including any active mmap
     /// access) are finished before the LMDB environment is closed and the files

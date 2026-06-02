@@ -1,9 +1,12 @@
+use crate::constants::MAX_INDEXABLE_FILE_SIZE;
 use ahash::AHashMap;
 use rayon::iter::{IndexedParallelIterator, ParallelIterator};
 use rayon::slice::ParallelSlice;
 use std::cell::UnsafeCell;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU16, AtomicUsize, Ordering};
+
+use crate::{FileItem, constants};
 
 /// Maximum number of distinct bigrams tracked in the inverted index.
 /// 95 printable ASCII chars (32..=126) after lowercasing → ~70 distinct → 4900 possible.
@@ -107,14 +110,8 @@ impl BigramIndexBuilder {
         &slab[start..start + self.words]
     }
 
-    // `pub` (via `#[doc(hidden)]`) only so the criterion bench can drive
-    // `add_file_content` directly. External consumers should use
-    // `build_bigram_index` instead.
-    ///
-    /// SAFETY: concurrent callers must partition `file_idx` by
-    /// word-aligned ranges so that `file_idx / 64` never collides across
-    /// threads. The `file_picker::build_bigram_index` driver enforces
-    /// this via `par_chunks` with a word-aligned chunk size.
+    // `pub` (via `#[doc(hidden)]`) only for benchmarking
+    // External consumers should use `build_bigram_index` instead.
     #[doc(hidden)]
     pub fn add_file_content(&self, skip_builder: &Self, file_idx: usize, content: &[u8]) {
         if content.len() < 2 {
@@ -596,7 +593,6 @@ impl BigramOverlay {
     }
 }
 
-pub const BIGRAM_CONTENT_CAP: usize = 64 * 1024;
 const BIGRAM_CHUNK_FILES: usize = 4 * 64;
 
 /// Sparse-column cutoff for the skip-1 sub-index. Rare skip columns add
@@ -605,50 +601,54 @@ const BIGRAM_CHUNK_FILES: usize = 4 * 64;
 const SKIP_INDEX_MIN_DENSITY_PCT: u32 = 12;
 
 thread_local! {
-    /// Per-rayon-worker reusable read buffer. 64 KB is too large to
-    /// keep on the default pthread stack (macOS ships 512 KB), so the
-    /// buffer lives on the heap behind a `Box<[u8; N]>`. TLS keeps the
-    /// allocation alive for the thread's lifetime so we pay the cost
-    /// once, not per file.
-    static READ_BUF: std::cell::RefCell<Box<[u8; BIGRAM_CONTENT_CAP]>> =
-        std::cell::RefCell::new(Box::new([0u8; BIGRAM_CONTENT_CAP]));
+    /// Reusable read buffer that is allocated per thread and used for reading files
+    static READ_BUF: std::cell::RefCell<Box<[u8]>> =
+        std::cell::RefCell::new(vec![0u8; MAX_INDEXABLE_FILE_SIZE].into_boxed_slice());
 }
 
-/// Outcome of processing one file's content.
-enum FileOutcome {
-    /// Content contained a NUL byte — mark the file as binary so future
-    /// greps skip it without re-reading.
-    Binary,
-    /// Read succeeded and the content was fed to the bigram builder.
-    Indexed,
-    /// File was empty or failed to open; nothing to do.
-    Skipped,
+/// Reads bigram chunk, we *SHOULD NOT* use mmap cache here because bigram is built off-lock
+/// if the watcher thread tries to invalidate mmap during the borrow from it - UAB or segfaut
+///
+/// mmap should only be used by the locked version of grep which absolutely minimizes any riscs
+#[inline]
+fn read_bigram_chunk<'a>(
+    file: &FileItem,
+    base_fd: libc::c_int,
+    base_path: &std::path::Path,
+    arena: crate::simd_path::ArenaPtr,
+    buf: &'a mut [u8],
+    path_buf: &mut [u8; crate::simd_path::PATH_BUF_SIZE],
+) -> Option<&'a [u8]> {
+    let want = (file.size as usize).min(MAX_INDEXABLE_FILE_SIZE);
+    let filled = file.read_trimmed_into_buf(base_fd, base_path, arena, path_buf, &mut buf[..want]);
+    if filled == 0 {
+        return None;
+    }
+
+    let data = &buf[..filled];
+
+    Some(data)
 }
 
 #[tracing::instrument(skip_all, name = "Building Bigram Index", level = tracing::Level::DEBUG)]
 pub(crate) fn build_bigram_index(
     files: &[crate::types::FileItem],
-    budget: &crate::types::ContentCacheBudget,
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
-) -> (BigramFilter, Vec<usize>) {
-    let start = std::time::Instant::now();
-    tracing::info!("Building bigram index for {} files...", files.len());
-
+) -> BigramFilter {
     let builder = BigramIndexBuilder::new(files.len());
     let skip_builder = BigramIndexBuilder::new(files.len());
 
-    // this does remove a memcpy for every single file + actually reducing open time on macos
     #[cfg(unix)]
     let base_fd: libc::c_int = open_base_dir_fd(base_path);
     #[cfg(not(unix))]
     let base_fd: i32 = -1;
 
-    // `content_binary` is only touched from the Binary branch below, so
-    // the mutex is cold in practice. A lock-free collector wasn't worth
-    // the complexity.
-    let content_binary: std::sync::Mutex<Vec<usize>> = std::sync::Mutex::new(Vec::new());
-
+    // Always reads each file into the thread-local READ_BUF — never aliases the
+    // persistent mmap cache. See `read_bigram_chunk` for the rationale: this
+    // pass runs detached on the background pool without holding the picker
+    // read lock, so a watcher event mutating a `FileItem` would race any
+    // borrow we took from a cached `Mmap`.
     crate::file_picker::BACKGROUND_THREAD_POOL.install(|| {
         files
             .par_chunks(BIGRAM_CHUNK_FILES)
@@ -657,183 +657,75 @@ pub(crate) fn build_bigram_index(
                 let base_idx = chunk_idx * BIGRAM_CHUNK_FILES;
                 for (offset, file) in chunk.iter().enumerate() {
                     let file_idx = base_idx + offset;
-                    let outcome = process_file(
-                        file,
-                        file_idx,
-                        &builder,
-                        &skip_builder,
-                        base_fd,
-                        base_path,
-                        arena,
-                        budget,
-                    );
-                    if matches!(outcome, FileOutcome::Binary) {
-                        content_binary.lock().unwrap().push(file_idx);
+
+                    if file.is_binary() || file.size == 0 {
+                        return;
                     }
+
+                    READ_BUF.with(|read_cell| {
+                        let mut buf = read_cell.borrow_mut();
+                        let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+
+                        if let Some(content) = read_bigram_chunk(
+                            file,
+                            base_fd,
+                            base_path,
+                            arena,
+                            &mut buf[..],
+                            &mut path_buf,
+                        ) {
+                            // we have to manually ensure that every byte is a valid text byte to
+                            // perform this we have to scan every file, first 512 bytes is not enough
+                            // so basically we rely on the fact that first 2MB will always contain
+                            // an invalid text sequence if this is not a binary file.
+                            //
+                            // Need to find a better way to do this.
+                            file.set_binary(crate::types::detect_binary_content(content));
+
+                            builder.add_file_content(&skip_builder, file_idx, content);
+                        }
+                    });
                 }
             });
     });
 
     #[cfg(unix)]
     if base_fd >= 0 {
-        // SAFETY: we opened `base_fd` at the top of this function and
-        // no worker still references it once the rayon pool joined.
         unsafe { libc::close(base_fd) };
     }
 
-    let content_binary_vec = content_binary.into_inner().unwrap();
-
-    let cols = builder.columns_used();
     let mut index = builder.compress(None);
     let skip_index = skip_builder.compress(Some(SKIP_INDEX_MIN_DENSITY_PCT));
     index.set_skip_index(skip_index);
 
-    // Builder buffers were freed by `compress()` above (one deallocation
-    // each); nudge mimalloc to return them (and any transient allocs)
-    // to the OS.
+    // in progress bigram walk + rust's ignore crate allocates shit ton of garbage memory
+    // all custom allocators would think this is available resource while we do not allocate
+    // after the sync, so it's very important to let the unused memory go back to the OS
     crate::file_picker::hint_allocator_collect();
 
-    tracing::info!(
-        "Bigram index built in {:.2}s — {} dense columns for {} files",
-        start.elapsed().as_secs_f64(),
-        cols,
-        files.len(),
-    );
-    if !content_binary_vec.is_empty() {
-        tracing::info!(
-            "Bigram build detected {} content-binary files (not caught by extension)",
-            content_binary_vec.len(),
-        );
-    }
-
-    (index, content_binary_vec)
+    index
 }
 
-/// Process one file: read up to `BIGRAM_CONTENT_CAP` bytes, feed them
-/// to the bigram builder (or record as binary / skipped).
-///
-/// `base_fd` is the parent-directory fd for the Unix `openat` fast
-/// path, or `-1` to force the portable `std::fs::File::open` fallback.
-#[inline]
-#[allow(clippy::too_many_arguments)]
-fn process_file(
-    file: &crate::types::FileItem,
-    file_idx: usize,
-    builder: &BigramIndexBuilder,
-    skip_builder: &BigramIndexBuilder,
-    base_fd: i32,
+#[tracing::instrument(skip_all, name = "Sniffing Large Files Binary", level = tracing::Level::DEBUG)]
+pub(crate) fn sniff_binary_for_non_indexable(
+    files: &[FileItem],
     base_path: &std::path::Path,
     arena: crate::simd_path::ArenaPtr,
-    budget: &crate::types::ContentCacheBudget,
-) -> FileOutcome {
-    if file.is_binary() || file.size == 0 || file.size > budget.max_file_size {
-        return FileOutcome::Skipped;
-    }
-
-    // Zero-copy fast path: the warmup phase may have cached this file's
-    // content already. Avoid re-reading from disk.
-    if let Some(cached) = file.get_content(arena, base_path, budget) {
-        if crate::file_picker::detect_binary_content(cached) {
-            return FileOutcome::Binary;
-        }
-        let capped = &cached[..cached.len().min(BIGRAM_CONTENT_CAP)];
-        builder.add_file_content(skip_builder, file_idx, capped);
-        return FileOutcome::Indexed;
-    }
-
-    let want = (file.size as usize).min(BIGRAM_CONTENT_CAP);
+) {
+    // Non-indexable files are few in a typical repo, so a serial pass with a
+    // single reused chunk buffer beats spinning up the thread pool.
     let mut path_buf = [0u8; crate::simd_path::PATH_BUF_SIZE];
+    let mut chunk = vec![0u8; crate::types::BINARY_CLASSIFICATION_CHUNK_SIZE];
 
-    READ_BUF.with(|read_cell| {
-        let mut buf = read_cell.borrow_mut();
-        let filled = read_file_content(
-            file,
-            base_fd,
-            base_path,
-            arena,
-            &mut path_buf,
-            &mut buf[..want],
-        );
-        if filled == 0 {
-            return FileOutcome::Skipped;
+    for file in files {
+        // check only the files that we are able to grep
+        if file.size == 0 || file.size > constants::MAX_FFFILE_SIZE {
+            continue;
         }
-        let data = &buf[..filled];
-        if crate::file_picker::detect_binary_content(data) {
-            return FileOutcome::Binary;
-        }
-        builder.add_file_content(skip_builder, file_idx, data);
-        FileOutcome::Indexed
-    })
-}
 
-/// Read up to `buf.len()` bytes of `file`'s content into `buf`. Returns
-/// the number of bytes actually read (0 on any error, so callers treat
-/// failures as "skip").
-#[inline]
-fn read_file_content(
-    file: &crate::types::FileItem,
-    base_fd: i32,
-    base_path: &std::path::Path,
-    arena: crate::simd_path::ArenaPtr,
-    path_buf: &mut [u8; crate::simd_path::PATH_BUF_SIZE],
-    buf: &mut [u8],
-) -> usize {
-    #[cfg(unix)]
-    {
-        read_file_content_unix(file, base_fd, base_path, arena, path_buf, buf)
+        let abs = file.write_absolute_path(arena, base_path, &mut path_buf);
+        file.detect_binary_per_byte(abs, &mut chunk);
     }
-    #[cfg(not(unix))]
-    {
-        let _ = base_fd;
-        read_file_content_std(file, base_path, arena, path_buf, buf)
-    }
-}
-
-#[cfg(unix)]
-fn read_file_content_unix(
-    file: &crate::types::FileItem,
-    base_fd: libc::c_int,
-    base_path: &std::path::Path,
-    arena: crate::simd_path::ArenaPtr,
-    path_buf: &mut [u8; crate::simd_path::PATH_BUF_SIZE],
-    buf: &mut [u8],
-) -> usize {
-    let fd = if base_fd >= 0 {
-        let rel_cstr = file.write_relative_cstr(arena, path_buf);
-        // SAFETY: `rel_cstr` is NUL-terminated, `base_fd` is a valid
-        // directory descriptor owned by the caller.
-        unsafe { libc::openat(base_fd, rel_cstr.as_ptr(), libc::O_RDONLY) }
-    } else {
-        use std::os::unix::io::IntoRawFd;
-        let abs = file.write_absolute_path(arena, base_path, path_buf);
-        match std::fs::File::open(abs) {
-            Ok(f) => f.into_raw_fd(),
-            Err(_) => return 0,
-        }
-    };
-    if fd < 0 {
-        return 0;
-    }
-
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        // SAFETY: `fd` is an owned descriptor, `buf[filled..]` is a
-        // valid writable slice for `buf.len() - filled` bytes.
-        let n = unsafe {
-            libc::read(
-                fd,
-                buf[filled..].as_mut_ptr() as *mut libc::c_void,
-                (buf.len() - filled) as libc::size_t,
-            )
-        };
-        if n <= 0 {
-            break;
-        }
-        filled += n as usize;
-    }
-    // SAFETY: matching close for the owned descriptor.
-    unsafe { libc::close(fd) };
-    filled
 }
 
 /// Open the base directory for the `openat` fast path. Returns `-1` on
@@ -856,33 +748,6 @@ fn open_base_dir_fd(base_path: &std::path::Path) -> libc::c_int {
             libc::O_RDONLY | libc::O_DIRECTORY,
         )
     }
-}
-
-/// Portable fallback (Windows + non-`openat` Unix): `std::fs::File` +
-/// `Read::read` into `buf`. Used on Windows unconditionally, and on
-/// Unix when the base directory fd could not be opened.
-#[cfg(not(unix))]
-fn read_file_content_std(
-    file: &crate::types::FileItem,
-    base_path: &std::path::Path,
-    arena: crate::simd_path::ArenaPtr,
-    path_buf: &mut [u8; crate::simd_path::PATH_BUF_SIZE],
-    buf: &mut [u8],
-) -> usize {
-    use std::io::Read;
-    let abs = file.write_absolute_path(arena, base_path, path_buf);
-    let Ok(mut f) = std::fs::File::open(abs) else {
-        return 0;
-    };
-    let mut filled = 0usize;
-    while filled < buf.len() {
-        match f.read(&mut buf[filled..]) {
-            Ok(0) => break,
-            Ok(n) => filled += n,
-            Err(_) => return 0,
-        }
-    }
-    filled
 }
 
 #[cfg(test)]

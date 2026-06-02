@@ -1,6 +1,6 @@
 [package]
 name = "fff-search"
-version = "0.7.0"
+version = "0.8.4"
 edition = "2024"
 license = "MIT"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlook.com>"]
@@ -39,18 +39,14 @@ rayon = { workspace = true }
 smallvec = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-fff-query-parser = { workspace = true }
-
-# External dependencies
-bindet = { workspace = true }
+fff-query-parser = { workspace = true , version = "0.8.2" }
 blake3 = { workspace = true }
-chrono = { workspace = true }
 dirs = { workspace = true }
 libc = "0.2"
 git2 = { workspace = true }
 glidesort = { workspace = true }
 globset = { workspace = true }
-fff-grep = { workspace = true }
+fff-grep = { workspace = true , version = "0.8.2" }
 aho-corasick = "1"
 memchr = "2"
 heed = { workspace = true }
@@ -59,15 +55,11 @@ memmap2 = { workspace = true }
 neo_frizbee = { workspace = true }
 notify = { workspace = true }
 notify-debouncer-full = { workspace = true }
-once_cell = { workspace = true }
 parking_lot = { workspace = true }
 pathdiff = { workspace = true }
 regex = { workspace = true }
 regex-syntax = "0.8"
 serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-smartstring = { version = "1.0.1", features = ["serde"] }
-toml = "0.8"
 tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 zlob = { workspace = true, optional = true }
@@ -79,6 +71,7 @@ dunce = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
+ctor = "0.2"
 proptest = { version = "1", default-features = false, features = ["std", "fork"] }
 rand = { version = "0.8", features = ["small_rng"] }
 tempfile = "3.8"
