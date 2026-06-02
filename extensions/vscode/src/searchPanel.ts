@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { FffInstanceHandle, liveGrep } from "./ffi";
+import { extensionIconMap, fileNameIconMap } from "./icons";
 
 // ── Provider ────────────────────────────────────────────────────────────────
 
@@ -29,10 +30,12 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
 
     webviewView.webview.options = {
       enableScripts: true,
-      localResourceRoots: [],
+      localResourceRoots: [
+        vscode.Uri.joinPath(this._extensionUri, "resources"),
+      ],
     };
 
-    webviewView.webview.html = this.getHtml();
+    webviewView.webview.html = this.getHtml(webviewView.webview);
     webviewView.webview.onDidReceiveMessage((msg) => this.handleMessage(msg));
 
     // Focus the search input when the panel opens
@@ -80,7 +83,7 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
     try {
       const grepResults = liveGrep(inst, this.searchQuery, {
         smartCase: true,
-        pageLimit: 50,
+        pageLimit: 100,
         beforeContext: 0,
         afterContext: 0,
       });
@@ -141,7 +144,20 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
 
   // ── HTML ─────────────────────────────────────────────────────────────────
 
-  private getHtml(): string {
+  private getHtml(webview: vscode.Webview): string {
+    // Pre-compute webview URIs for all icon files
+    const iconUriMap: Record<string, string> = {};
+    const iconNames = new Set([
+      ...Object.values(extensionIconMap),
+      ...Object.values(fileNameIconMap),
+      "folder", "default",
+    ]);
+    for (const name of iconNames) {
+      iconUriMap[name] = webview.asWebviewUri(
+        vscode.Uri.joinPath(this._extensionUri, "resources", "icons", name + ".svg"),
+      ).toString();
+    }
+
     return `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -208,6 +224,7 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
   }
   .file-row:hover { background: var(--list-hover); }
   .file-row .arrow { font-size: 10px; width: 12px; text-align: center; }
+  .file-row .file-icon { width: 16px; height: 16px; flex-shrink: 0; }
   .file-row .name { flex: 1; }
   .file-row .count { font-size: 11px; opacity: 0.6; }
 
@@ -258,14 +275,14 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
 <div id="results-header" class="results-header" style="display:none"></div>
 <div id="results"></div>
 
-<script src="data:text/javascript;charset=utf-8,${encodeURIComponent(this.getScript())}"></script>
+<script src="data:text/javascript;charset=utf-8,${encodeURIComponent(this.getScript(iconUriMap))}"></script>
 </body>
 </html>`;
   }
 
   // ── Script (data URI) ───────────────────────────────────────────────────
 
-  private getScript(): string {
+  private getScript(iconUriMap: Record<string, string>): string {
     return `
 var vscode = acquireVsCodeApi();
 var resultsEl = document.getElementById("results");
@@ -274,6 +291,27 @@ var searchEl = document.getElementById("search-input");
 var replaceEl = document.getElementById("replace-input");
 var toggleReplaceEl = document.getElementById("toggle-replace");
 var currentQuery = "";
+
+// ── File icon maps ──────────────────────────────────────────────
+var extIcons = ${JSON.stringify(extensionIconMap)};
+var nameIcons = ${JSON.stringify(fileNameIconMap)};
+var iconUris = ${JSON.stringify(iconUriMap)};
+
+function fileIconFor(fileName) {
+  var lower = fileName.toLowerCase();
+  if (nameIcons[lower]) return nameIcons[lower];
+  var dot = lower.lastIndexOf(".");
+  var ext = dot >= 0 ? lower.substring(dot + 1) : "";
+  if (ext && extIcons[ext]) return extIcons[ext];
+  if (lower.startsWith(".")) return "config";
+  return "default";
+}
+
+function iconHtml(fileName) {
+  var name = fileIconFor(fileName);
+  var src = iconUris[name] || iconUris["default"];
+  return '<img class="file-icon" src="' + escAttr(src) + '" alt="" />';
+}
 
 // Replace toggle
 toggleReplaceEl.addEventListener("click", function() {
@@ -356,15 +394,23 @@ function renderResults(results, query) {
     files.get(r.relativePath).matches.push(r);
   }
   headerEl.style.display = "";
-  headerEl.textContent = results.length + " results in " + files.size + " files";
+  var totalMatches = 0;
+  for (var i = 0; i < results.length; i++) {
+    totalMatches += (results[i].matchRanges ? results[i].matchRanges.length : 0);
+  }
+  headerEl.textContent = totalMatches + " results in " + files.size + " files";
 
   var html = "";
   files.forEach(function(group, path) {
-    var matchCount = group.matches.length;
+    var matchCount = 0;
+    for (var j = 0; j < group.matches.length; j++) {
+      matchCount += (group.matches[j].matchRanges ? group.matches[j].matchRanges.length : 0);
+    }
     var fileId = "f" + path.replace(/[^a-zA-Z0-9]/g, "_");
     html += '<div class="file-group">';
     html += '<div class="file-row" data-action="toggle" data-file-id="' + escAttr(fileId) + '">';
     html += '<span class="arrow" id="arrow-' + escAttr(fileId) + '">\u2304</span>';
+    html += iconHtml(group.fileName);
     html += '<span class="name">' + escHtml(path) + '</span>';
     html += '<span class="count">' + matchCount + ' match' + (matchCount > 1 ? 'es' : '') + '</span>';
     html += '</div>';

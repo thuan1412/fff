@@ -1,5 +1,6 @@
 import * as vscode from "vscode";
 import { FffInstanceHandle, search, trackQuery } from "./ffi";
+import { iconPathUri } from "./icons";
 
 export function registerFileSearch(
   context: vscode.ExtensionContext,
@@ -44,6 +45,7 @@ export function registerFileSearch(
             paths.push(item.relativePath);
             return {
               label: item.fileName,
+              iconPath: iconPathUri(context.extensionUri, item.fileName),
               description: item.relativePath,
               alwaysShow: true,
             };
@@ -127,6 +129,7 @@ export function registerFileAndDirSearch(
             paths.push(item.relativePath);
             return {
               label: item.fileName,
+              iconPath: iconPathUri(context.extensionUri, item.fileName),
               description: item.relativePath,
             };
           });
