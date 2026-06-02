@@ -11,6 +11,7 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
 
   // State
   private searchQuery = "";
+  private searchMode: "plain" | "regex" | "fuzzy" = "plain";
   private results: GrepMatch[] = [];
   private isSearching = false;
 
@@ -54,6 +55,7 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
         break;
       case "search":
         this.searchQuery = msg.query || "";
+        this.searchMode = msg.mode || "plain";
         this.debounceSearch();
         break;
       case "openFile":
@@ -82,6 +84,7 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
     this.postMessage({ type: "searching", searching: true });
     try {
       const grepResults = liveGrep(inst, this.searchQuery, {
+        mode: this.searchMode,
         smartCase: true,
         pageLimit: 100,
         beforeContext: 0,
@@ -210,6 +213,22 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
   }
   .toggle-btn:hover { opacity: 1; }
 
+  /* ── Mode toggle buttons ───────────────── */
+  .mode-btns {
+    display: flex; gap: 2px; flex-shrink: 0;
+  }
+  .mode-btn {
+    background: none; border: 1px solid transparent;
+    color: var(--fg); cursor: pointer; font: 11px var(--vscode-font-family);
+    padding: 2px 5px; border-radius: 3px; opacity: 0.7;
+  }
+  .mode-btn:hover { opacity: 1; background: var(--list-hover); }
+  .mode-btn.active {
+    opacity: 1;
+    border-color: var(--focus-border);
+    background: var(--list-active);
+  }
+
   /* ── Results area ──────────────────────────────────────────── */
   .results-header {
     padding: 4px 8px;
@@ -257,6 +276,11 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
 
 <div class="input-row">
   <input id="search-input" type="text" placeholder="Search" autofocus />
+  <div class="mode-btns">
+    <button id="mode-plain" class="mode-btn active" title="Plain text search">Ab</button>
+    <button id="mode-regex" class="mode-btn" title="Regular expression search">.*</button>
+    <button id="mode-fuzzy" class="mode-btn" title="Fuzzy search">~</button>
+  </div>
 </div>
 
 <div class="input-row">
@@ -291,6 +315,25 @@ var searchEl = document.getElementById("search-input");
 var replaceEl = document.getElementById("replace-input");
 var toggleReplaceEl = document.getElementById("toggle-replace");
 var currentQuery = "";
+var currentMode = "plain";
+
+// ── Mode toggle buttons ───────────────────────────────────────
+var modeBtns = {
+  plain: document.getElementById("mode-plain"),
+  regex: document.getElementById("mode-regex"),
+  fuzzy: document.getElementById("mode-fuzzy"),
+};
+
+function setMode(mode) {
+  currentMode = mode;
+  modeBtns.plain.classList.toggle("active", mode === "plain");
+  modeBtns.regex.classList.toggle("active", mode === "regex");
+  modeBtns.fuzzy.classList.toggle("active", mode === "fuzzy");
+}
+
+modeBtns.plain.addEventListener("click", function() { setMode("plain"); });
+modeBtns.regex.addEventListener("click", function() { setMode("regex"); });
+modeBtns.fuzzy.addEventListener("click", function() { setMode("fuzzy"); });
 
 // ── File icon maps ──────────────────────────────────────────────
 var extIcons = ${JSON.stringify(extensionIconMap)};
@@ -324,7 +367,7 @@ toggleReplaceEl.addEventListener("click", function() {
 searchEl.addEventListener("keydown", function(e) {
   if (e.key === "Enter") {
     currentQuery = searchEl.value;
-    vscode.postMessage({ type: "search", query: currentQuery });
+    vscode.postMessage({ type: "search", query: currentQuery, mode: currentMode });
   }
 });
 
@@ -334,7 +377,7 @@ searchEl.addEventListener("input", function() {
   clearTimeout(searchTimer);
   searchTimer = setTimeout(function() {
     currentQuery = searchEl.value;
-    vscode.postMessage({ type: "search", query: currentQuery });
+    vscode.postMessage({ type: "search", query: currentQuery, mode: currentMode });
   }, 300);
 });
 
