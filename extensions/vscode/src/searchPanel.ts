@@ -115,7 +115,10 @@ export class SearchPanelProvider implements vscode.WebviewViewProvider {
   ): Promise<void> {
     const workspaceRoot =
       vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-    const fileUri = vscode.Uri.file(workspaceRoot + "/" + relativePath);
+    const fileUri = vscode.Uri.joinPath(
+      vscode.Uri.file(workspaceRoot),
+      relativePath,
+    );
 
     try {
       const doc = await vscode.workspace.openTextDocument(fileUri);
@@ -271,7 +274,6 @@ var searchEl = document.getElementById("search-input");
 var replaceEl = document.getElementById("replace-input");
 var toggleReplaceEl = document.getElementById("toggle-replace");
 var currentQuery = "";
-var currentResults = [];
 
 // Replace toggle
 toggleReplaceEl.addEventListener("click", function() {
@@ -298,13 +300,37 @@ searchEl.addEventListener("input", function() {
   }, 300);
 });
 
+// Event delegation: handle clicks on file rows (toggle) and match rows (open)
+resultsEl.addEventListener("click", function(e) {
+  var target = e.target.closest("[data-action]");
+  if (!target) return;
+
+  var action = target.getAttribute("data-action");
+  if (action === "toggle") {
+    var fileId = target.getAttribute("data-file-id");
+    var list = document.getElementById(fileId);
+    var arrow = document.getElementById("arrow-" + fileId);
+    if (list.classList.contains("open")) {
+      list.classList.remove("open");
+      arrow.textContent = "\u203A";
+    } else {
+      list.classList.add("open");
+      arrow.textContent = "\u2304";
+    }
+  } else if (action === "open") {
+    var path = target.getAttribute("data-path");
+    var line = parseInt(target.getAttribute("data-line"), 10) || 0;
+    var col = parseInt(target.getAttribute("data-col"), 10) || 0;
+    vscode.postMessage({ type: "openFile", relativePath: path, lineNumber: line, col: col });
+  }
+});
+
 // Handle messages from extension
 window.addEventListener("message", function(event) {
   var msg = event.data;
   switch (msg.type) {
     case "results":
-      currentResults = msg.results || [];
-      renderResults(currentResults, msg.query || "");
+      renderResults(msg.results || [], msg.query || "");
       break;
     case "searching":
       if (msg.searching) {
@@ -337,46 +363,30 @@ function renderResults(results, query) {
     var matchCount = group.matches.length;
     var fileId = "f" + path.replace(/[^a-zA-Z0-9]/g, "_");
     html += '<div class="file-group">';
-    html += '<div class="file-row" onclick="window._toggleFile(\\'' + fileId + "\\')\\\">";
-    html += '<span class=\\\"arrow\\\" id=\\\"arrow-' + fileId + '\\\">\u2304</span>';
-    html += '<span class=\\\"name\\\">' + escHtml(path) + "</span>";
-    html += '<span class=\\\"count\\\">' + matchCount + " match" + (matchCount > 1 ? "es" : "") + "</span>";
-    html += "</div>";
-    html += '<div class=\\\"match-list open\\\" id=\\\"' + fileId + '\\\">';
+    html += '<div class="file-row" data-action="toggle" data-file-id="' + escAttr(fileId) + '">';
+    html += '<span class="arrow" id="arrow-' + escAttr(fileId) + '">\u2304</span>';
+    html += '<span class="name">' + escHtml(path) + '</span>';
+    html += '<span class="count">' + matchCount + ' match' + (matchCount > 1 ? 'es' : '') + '</span>';
+    html += '</div>';
+    html += '<div class="match-list open" id="' + escAttr(fileId) + '">';
     for (var j = 0; j < group.matches.length; j++) {
       var m = group.matches[j];
-      html += '<div class=\\\"match-row\\\" onclick=\\\"window._openFile(\\'' + escAttr(m.relativePath) + "\\\"," + m.lineNumber + "," + m.col + ")\\\">";
-      html += '<span class=\\\"line-num\\\">' + m.lineNumber + "</span>";
-      html += '<span class=\\\"line-content\\\">' + highlightLine(m.lineContent, m.matchRanges) + "</span>";
-      html += "</div>";
+      html += '<div class="match-row" data-action="open" data-path="' + escAttr(m.relativePath) + '" data-line="' + m.lineNumber + '" data-col="' + m.col + '">';
+      html += '<span class="line-num">' + m.lineNumber + '</span>';
+      html += '<span class="line-content">' + highlightLine(m.lineContent, m.matchRanges) + '</span>';
+      html += '</div>';
     }
-    html += "</div></div>";
+    html += '</div></div>';
   });
   resultsEl.innerHTML = html;
 }
-
-window._toggleFile = function(fileId) {
-  var list = document.getElementById(fileId);
-  var arrow = document.getElementById("arrow-" + fileId);
-  if (list.classList.contains("open")) {
-    list.classList.remove("open");
-    arrow.textContent = "\u203A";
-  } else {
-    list.classList.add("open");
-    arrow.textContent = "\u2304";
-  }
-};
-
-window._openFile = function(relativePath, lineNumber, col) {
-  vscode.postMessage({ type: "openFile", relativePath: relativePath, lineNumber: lineNumber, col: col });
-};
 
 function escHtml(s) {
   return s.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function escAttr(s) {
-  return s.replace(/'/g, "\\\\'").replace(/"/g, "&quot;");
+  return s.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
 }
 
 function highlightLine(content, ranges) {
@@ -385,7 +395,7 @@ function highlightLine(content, ranges) {
   var pos = 0;
   for (var i = 0; i < ranges.length; i++) {
     result += escHtml(content.substring(pos, ranges[i].start));
-    result += '<span class="hl">' + escHtml(content.substring(ranges[i].start, ranges[i].end)) + "</span>";
+    result += '<span class="hl">' + escHtml(content.substring(ranges[i].start, ranges[i].end)) + '</span>';
     pos = ranges[i].end;
   }
   result += escHtml(content.substring(pos));

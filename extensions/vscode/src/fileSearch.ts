@@ -19,10 +19,12 @@ export function registerFileSearch(
     quickPick.items = [];
 
     let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+    let relativePaths: string[] = [];
 
     quickPick.onDidChangeValue((value) => {
       if (!value.trim()) {
         quickPick.items = [];
+        relativePaths = [];
         return;
       }
 
@@ -38,13 +40,12 @@ export function registerFileSearch(
             pageSize: 30,
           });
 
-          const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-
+          const paths: string[] = [];
           quickPick.items = results.items.map((item, i) => {
-            const score = results.scores[i];
             const dir = item.relativePath.includes("/")
               ? item.relativePath.substring(0, item.relativePath.lastIndexOf("/"))
               : "";
+            paths.push(item.relativePath);
 
             return {
               label: item.fileName,
@@ -53,31 +54,37 @@ export function registerFileSearch(
                 ? `[${item.gitStatus.trim()}] ${item.relativePath}`
                 : item.relativePath,
               alwaysShow: true,
-              // Store the relative path for use on accept
-              _relativePath: item.relativePath,
-            } as FileQuickPickItem;
+            };
           });
+          relativePaths = paths;
         } catch {
           // Silently ignore search errors during typing
         }
       }, 50);
     });
 
-    quickPick.onDidAccept(() => {
-      const selected = quickPick.selectedItems[0] as FileQuickPickItem | undefined;
+    quickPick.onDidAccept(async () => {
+      const selected = quickPick.selectedItems[0];
       if (!selected) return;
 
-      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-      const fileUri = vscode.Uri.file(workspaceRoot + "/" + selected._relativePath);
+      const idx = quickPick.items.indexOf(selected);
+      if (idx < 0 || idx >= relativePaths.length) return;
 
-      // Track for frecency
+      const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+      const fileUri = vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), relativePaths[idx]);
+
       const inst = getInstance();
       if (inst) {
-        trackQuery(inst, quickPick.value, selected._relativePath);
+        try { trackQuery(inst, quickPick.value, relativePaths[idx]); } catch { /* non-critical */ }
       }
 
-      vscode.commands.executeCommand("vscode.open", fileUri);
       quickPick.hide();
+
+      try {
+        await vscode.window.showTextDocument(fileUri);
+      } catch {
+        vscode.window.showErrorMessage(`Could not open: ${relativePaths[idx]}`);
+      }
     });
 
     quickPick.onDidHide(() => {
@@ -88,9 +95,6 @@ export function registerFileSearch(
   });
 }
 
-interface FileQuickPickItem extends vscode.QuickPickItem {
-  _relativePath: string;
-}
 
 export function registerFileAndDirSearch(
   context: vscode.ExtensionContext,
@@ -109,10 +113,12 @@ export function registerFileAndDirSearch(
     quickPick.matchOnDetail = true;
 
     let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+    let relativePaths: string[] = [];
 
     quickPick.onDidChangeValue((value) => {
       if (!value.trim()) {
         quickPick.items = [];
+        relativePaths = [];
         return;
       }
 
@@ -122,36 +128,45 @@ export function registerFileAndDirSearch(
           const inst = getInstance();
           if (!inst) return;
 
-          // Fall back to regular file search since we don't have a mixed wrapper yet;
-          // fff_search_mixed is available in the C API but skip for now.
           const results = search(inst, value, { pageSize: 30 });
-          const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
+          const paths: string[] = [];
 
-          quickPick.items = results.items.map((item) => ({
-            label: item.fileName,
-            description: item.relativePath,
-            _relativePath: item.relativePath,
-          })) as FileQuickPickItem[];
+          quickPick.items = results.items.map((item) => {
+            paths.push(item.relativePath);
+            return {
+              label: item.fileName,
+              description: item.relativePath,
+            };
+          });
+          relativePaths = paths;
         } catch {
           // Silently ignore search errors during typing
         }
       }, 50);
     });
 
-    quickPick.onDidAccept(() => {
-      const selected = quickPick.selectedItems[0] as FileQuickPickItem | undefined;
+    quickPick.onDidAccept(async () => {
+      const selected = quickPick.selectedItems[0];
       if (!selected) return;
 
+      const idx = quickPick.items.indexOf(selected);
+      if (idx < 0 || idx >= relativePaths.length) return;
+
       const workspaceRoot = vscode.workspace.workspaceFolders?.[0]?.uri.fsPath ?? "";
-      const uri = vscode.Uri.file(workspaceRoot + "/" + selected._relativePath);
+      const fileUri = vscode.Uri.joinPath(vscode.Uri.file(workspaceRoot), relativePaths[idx]);
 
       const inst = getInstance();
       if (inst) {
-        trackQuery(inst, quickPick.value, selected._relativePath);
+        try { trackQuery(inst, quickPick.value, relativePaths[idx]); } catch { /* non-critical */ }
       }
 
-      vscode.commands.executeCommand("vscode.open", uri);
       quickPick.hide();
+
+      try {
+        await vscode.window.showTextDocument(fileUri);
+      } catch {
+        vscode.window.showErrorMessage(`Could not open: ${relativePaths[idx]}`);
+      }
     });
 
     quickPick.onDidHide(() => quickPick.dispose());
