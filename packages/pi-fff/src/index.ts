@@ -1,26 +1,25 @@
 /**
  * pi-fff: FFF-powered file search extension for pi
  *
- * Overrides built-in `find` and `grep` tools with FFF and can also replace
- * @-mention autocomplete suggestions in the interactive editor.
+ * Overrides built-in `find` and `grep` tools with FFF and adds FFF-backed
+ * @-mention autocomplete suggestions to the interactive editor.
  */
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
-import { CustomEditor } from "@earendil-works/pi-coding-agent";
 import {
-  Text,
   type AutocompleteItem,
   type AutocompleteProvider,
+  Text,
 } from "@earendil-works/pi-tui";
-import { Type } from "@sinclair/typebox";
-import { FileFinder } from "@ff-labs/fff-node";
 import type {
   GrepCursor,
   GrepMode,
   GrepResult,
-  SearchResult,
   MixedItem,
+  SearchResult,
 } from "@ff-labs/fff-node";
+import { FileFinder } from "@ff-labs/fff-node";
+import { Type } from "@sinclair/typebox";
 import { buildQuery } from "./query";
 
 // ---------------------------------------------------------------------------
@@ -273,12 +272,6 @@ function createFffMentionProvider(
   };
 }
 
-// FffEditor is defined inside fffExtension() so it can capture `getMentionItems`
-// via closure rather than via a 4th constructor parameter. This makes the class
-// safe to subclass via `new SubClass(tui, theme, keybindings)` -- the pattern
-// pi-vim and pi-image-attachments use to compose editors. See:
-// https://github.com/badlogic/pi-mono/issues/3935
-
 // ---------------------------------------------------------------------------
 // Extension
 // ---------------------------------------------------------------------------
@@ -311,6 +304,21 @@ export default function fffExtension(pi: ExtensionAPI) {
     process.env.FFF_HISTORY_DB ??
     undefined;
 
+  // Root scanning opt-in: flag (boolean) > env ("1"/"true") > false.
+  // FFF refuses to init at / unless this is set. Home dir scanning is on by
+  // default for pi — launching pi from $HOME is a normal flow.
+  function resolveBoolOpt(flagName: string, envName: string): boolean {
+    const flag = pi.getFlag(flagName);
+    if (typeof flag === "boolean") return flag;
+    if (typeof flag === "string") return flag === "true" || flag === "1";
+    const env = process.env[envName];
+    return env === "1" || env === "true";
+  }
+  const enableFsRootScanning = resolveBoolOpt(
+    "fff-enable-root-scan",
+    "FFF_ENABLE_ROOT_SCAN",
+  );
+
   function getMode(): FffMode {
     return currentMode;
   }
@@ -340,6 +348,8 @@ export default function fffExtension(pi: ExtensionAPI) {
         frecencyDbPath,
         historyDbPath,
         aiMode: true,
+        enableHomeDirScanning: true,
+        enableFsRootScanning,
       });
 
       if (!result.ok)
@@ -391,72 +401,44 @@ export default function fffExtension(pi: ExtensionAPI) {
     });
   }
 
-  // Editor wrapper that injects FFF @-mention autocomplete alongside base provider.
-  // Defined inside fffExtension() so the class methods capture `getMentionItems`
-  // via closure. Subclasses constructed as `new Sub(tui, theme, keybindings)` by
-  // composability wrappers (pi-vim, pi-image-attachments) still get a working
-  // mention provider because the closure binding is preserved across subclassing.
-  class FffEditor extends CustomEditor {
-    private baseProvider: AutocompleteProvider | undefined;
-
-    override setAutocompleteProvider(provider: AutocompleteProvider): void {
-      this.baseProvider = provider;
-      // Create composite provider that handles @-mentions and falls back to base
-      const mentionProvider = createFffMentionProvider(getMentionItems);
-      const compositeProvider: AutocompleteProvider = {
-        getSuggestions: async (lines, cursorLine, cursorCol, options) => {
-          // Try @-mention first
-          const mentionResult = await mentionProvider.getSuggestions(
-            lines,
-            cursorLine,
-            cursorCol,
-            options,
-          );
-          if (mentionResult) return mentionResult;
-          // Fall back to base provider
-          return (
-            this.baseProvider?.getSuggestions(lines, cursorLine, cursorCol, options) ??
-            null
-          );
-        },
-        applyCompletion: (lines, cursorLine, cursorCol, item, prefix) => {
-          // Let mention provider handle @ completions, base provider for others
-          if (prefix?.startsWith("@")) {
-            return mentionProvider.applyCompletion!(
-              lines,
-              cursorLine,
-              cursorCol,
-              item,
-              prefix,
-            );
-          }
-          return (
-            this.baseProvider?.applyCompletion?.(
-              lines,
-              cursorLine,
-              cursorCol,
-              item,
-              prefix,
-            ) ?? { lines, cursorLine, cursorCol }
-          );
-        },
-      };
-      super.setAutocompleteProvider(compositeProvider);
-    }
-  }
-
-  function applyEditorMode(ctx: {
+  function registerAutocompleteProvider(ctx: {
     ui: {
-      setEditorComponent: (
-        factory: ((tui: any, theme: any, keybindings: any) => any) | undefined,
+      addAutocompleteProvider: (
+        factory: (current: AutocompleteProvider) => AutocompleteProvider,
       ) => void;
     };
   }) {
-    if (!shouldEnableMentions()) return;
+    ctx.ui.addAutocompleteProvider((current) => {
+      const mentionProvider = createFffMentionProvider(getMentionItems);
 
-    ctx.ui.setEditorComponent(
-      (tui: any, theme: any, keybindings: any) => new FffEditor(tui, theme, keybindings),
-    );
+      return {
+        async getSuggestions(lines, cursorLine, cursorCol, options) {
+          if (shouldEnableMentions()) {
+            try {
+              const mentionResult = await mentionProvider.getSuggestions(
+                lines,
+                cursorLine,
+                cursorCol,
+                options,
+              );
+              if (mentionResult) return mentionResult;
+            } catch {
+              // Delegate when FFF lookup is unavailable.
+            }
+          }
+
+          return current.getSuggestions(lines, cursorLine, cursorCol, options);
+        },
+        applyCompletion(lines, cursorLine, cursorCol, item, prefix) {
+          return current.applyCompletion(lines, cursorLine, cursorCol, item, prefix);
+        },
+        shouldTriggerFileCompletion(lines, cursorLine, cursorCol) {
+          return (
+            current.shouldTriggerFileCompletion?.(lines, cursorLine, cursorCol) ?? true
+          );
+        },
+      };
+    });
   }
 
   // --- Flags / lifecycle ---
@@ -476,10 +458,40 @@ export default function fffExtension(pi: ExtensionAPI) {
     type: "string",
   });
 
+  pi.registerFlag("fff-enable-root-scan", {
+    description:
+      "Allow indexing when launched from the filesystem root (also: FFF_ENABLE_ROOT_SCAN env)",
+    type: "boolean",
+  });
+
   pi.on("session_start", async (_event, ctx) => {
     try {
       activeCwd = ctx.cwd;
-      if (shouldEnableMentions()) applyEditorMode(ctx);
+
+      // Restore persisted mode from session entries. This handles session
+      // resume after process restart where env vars are lost, and ensures
+      // the env var is set for the next /reload in the same session.
+      const entries = ctx.sessionManager?.getEntries();
+      if (entries) {
+        const modeEntry = [...entries]
+          .reverse()
+          .find(
+            (e: { type: string; customType?: string }) =>
+              e.type === "custom" && e.customType === "fff-mode",
+          );
+        if (
+          modeEntry &&
+          typeof (modeEntry as any).data?.mode === "string" &&
+          VALID_MODES.includes((modeEntry as any).data.mode as FffMode)
+        ) {
+          const restored = (modeEntry as any).data.mode as FffMode;
+          if (restored !== currentMode) {
+            currentMode = restored;
+          }
+        }
+      }
+
+      registerAutocompleteProvider(ctx);
       await ensureFinder(activeCwd);
     } catch (e: unknown) {
       ctx.ui.notify(
@@ -932,8 +944,10 @@ export default function fffExtension(pi: ExtensionAPI) {
       if (!arg) {
         const mode = getMode();
         const flag = pi.getFlag("fff-mode") ?? "unset";
-        const env = process.env.PI_FFF_MODE ?? "unset";
-        ctx.ui.notify(`Current mode: '${mode}'\nFlag: ${flag}, Env: ${env}`, "info");
+        ctx.ui.notify(
+          `Current mode: '${mode}' (flag: ${flag})`,
+          "info",
+        );
         return;
       }
 
@@ -947,12 +961,11 @@ export default function fffExtension(pi: ExtensionAPI) {
       const oldMode = getMode();
       setMode(newMode);
 
-      // Apply immediately using the shared function
-      applyEditorMode(ctx);
+      pi.appendEntry("fff-mode", { mode: newMode });
 
       const note =
         (oldMode === "override") !== (newMode === "override")
-          ? " (tool name change requires restart)"
+          ? " (tool name change requires /reload)"
           : "";
       ctx.ui.notify(`Mode changed: '${oldMode}' → '${newMode}'${note}`, "info");
     },

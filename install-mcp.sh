@@ -8,6 +8,26 @@ REPO="dmtrKovalenko/fff.nvim"
 BINARY_NAME="fff-mcp"
 INSTALL_DIR="${FFF_MCP_INSTALL_DIR:-$HOME/.local/bin}"
 
+PINNED_RELEASE_TAG="v0.9.4"
+
+SHA256_X86_64_UNKNOWN_LINUX_MUSL="4ab4d98522aa0040767551cf890d4a314eb8dc7873fe3c43f59e40dc0ce7f947"
+SHA256_AARCH64_UNKNOWN_LINUX_MUSL="711f0ab935cc1018820b89439fcb461df19e1f0c36ea948c7089018d4d43bfc6"
+SHA256_X86_64_APPLE_DARWIN="20a91c0421ac05b9d32f0349ff147e5d0ad118ce6cd8a831ba9a873d98676cfd"
+SHA256_AARCH64_APPLE_DARWIN="90a7007d378583531cb3ca03037303ce0bd1ec7b31ca86a5b90d5683440df5b3"
+SHA256_X86_64_PC_WINDOWS_MSVC="6e81d83ef812fa2f3776b68f8076159644d1508103b7b39d13a8e504c0661cb5"
+SHA256_AARCH64_PC_WINDOWS_MSVC="7d1d2128187af20c2222d67e88e2e4ef6e85bd1708f8a9f9493d4c02cb84b57a"
+
+expected_sha_for() {
+    case "$1" in
+        x86_64-unknown-linux-musl)  echo "$SHA256_X86_64_UNKNOWN_LINUX_MUSL" ;;
+        aarch64-unknown-linux-musl) echo "$SHA256_AARCH64_UNKNOWN_LINUX_MUSL" ;;
+        x86_64-apple-darwin)        echo "$SHA256_X86_64_APPLE_DARWIN" ;;
+        aarch64-apple-darwin)       echo "$SHA256_AARCH64_APPLE_DARWIN" ;;
+        x86_64-pc-windows-msvc)     echo "$SHA256_X86_64_PC_WINDOWS_MSVC" ;;
+        aarch64-pc-windows-msvc)    echo "$SHA256_AARCH64_PC_WINDOWS_MSVC" ;;
+    esac
+}
+
 info() { printf '\033[1;34m%s\033[0m\n' "$*"; }
 success() { printf '\033[1;38;5;208m%s\033[0m\n' "$*"; }
 warn() { printf '\033[1;33m%s\033[0m\n' "$*"; }
@@ -59,6 +79,14 @@ detect_platform() {
 
 get_latest_release_tag() {
     local target="$1"
+
+    # Honor the pin baked in by `make bump-install-mcp-sh`. Required when SHAs
+    # are pinned, since fetching /releases would race against newer releases.
+    if [ -n "$PINNED_RELEASE_TAG" ]; then
+        echo "$PINNED_RELEASE_TAG"
+        return
+    fi
+
     local releases_json
     releases_json=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases") \
         || error "Failed to fetch releases from https://github.com/${REPO}/releases"
@@ -110,9 +138,17 @@ download_binary() {
         exit 1
     fi
 
-    # Verify checksum if sha256sum is available
+    # Verify checksum: prefer the SHA pinned in this script (offline, tamper-evident).
+    # Fall back to the .sha256 file on the release for targets/releases without a pin.
     if command -v sha256sum &>/dev/null; then
-        if curl -fsSL -o "${tmp_dir}/${filename}.sha256" "$checksum_url" 2>/dev/null; then
+        local pinned_sha
+        pinned_sha="$(expected_sha_for "$target")"
+        if [ -n "$pinned_sha" ]; then
+            info "Verifying checksum against pinned value..."
+            echo "${pinned_sha}  ${filename}" > "${tmp_dir}/${filename}.sha256"
+            (cd "$tmp_dir" && sha256sum -c "${filename}.sha256") \
+                || error "Checksum verification failed!"
+        elif curl -fsSL -o "${tmp_dir}/${filename}.sha256" "$checksum_url" 2>/dev/null; then
             info "Verifying checksum..."
             (cd "$tmp_dir" && sha256sum -c "${filename}.sha256") \
                 || error "Checksum verification failed!"

@@ -6,6 +6,8 @@
 
 Typo-resistant path and content search, frecency-ranked file access, a background watcher, and a lightweight in-memory content index. Way faster than CLIs like ripgrep and fzf in any long-running process that searches more than once.
 
+Powers file search in [opencode](http://github.com/anomalyco/opencode/), [nushell](https://github.com/nushell/nushell), and many more amazing projects!
+
 Originally started as [Neovim plugin](#neovim-plugin) people loved, but it turned out that plenty of AI harnesses and code editors need the same thing: accurate, fast file search as a library. That is what fff is.
 
 ---
@@ -35,9 +37,18 @@ Windows (PowerShell):
 irm https://raw.githubusercontent.com/dmtrKovalenko/fff.nvim/main/install-mcp.ps1 | iex
 ```
 
-The scripts live at [`install-mcp.sh`](./install-mcp.sh) and [`install-mcp.ps1`](./install-mcp.ps1) if you want to read them first.
+The scripts live at [`install-mcp.sh`](./install-mcp.sh) and [`install-mcp.ps1`](./install-mcp.ps1) if you want to read them first. They print the exact wiring instructions for your client.
 
-It prints the exact wiring instructions for your client. Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
+### Homebrew (macOS / Linux)
+
+```bash
+brew install dmtrKovalenko/fff/fff-mcp
+brew upgrade fff-mcp   # after new stable releases
+```
+
+Formula lives in [`Formula/fff-mcp.rb`](./Formula/fff-mcp.rb) in this repo and is **auto-bumped on every stable release** (see `bump-homebrew-formula` in [`.github/workflows/release.yaml`](./.github/workflows/release.yaml)). Installs the prebuilt `fff-mcp` binary from [GitHub releases](https://github.com/dmtrKovalenko/fff.nvim/releases).
+
+Once the server is connected, ask the agent to "use fff" and it picks up the `ffgrep`, `fffind`, and `fff-multi-grep` tools.
 
 ### Recommended agent prompt
 
@@ -256,6 +267,12 @@ require('fff').setup({
   max_threads = 4,
   lazy_sync = true,
   prompt_vim_mode = false,
+  follow_symlinks = false,
+  -- Allow indexing the user's $HOME directory. Enabled by default.
+  -- Disable if you strictly sure you don't want this, as it makes whole fff error hard
+  enable_home_dir_scanning = true,
+  -- Allow indexing a filesystem root (e.g. `/`, `C:\`). Disabled by default
+  enable_fs_root_scanning = false,
   layout = {
     height = 0.8,
     width = 0.8,
@@ -314,6 +331,10 @@ require('fff').setup({
   git = {
     status_text_color = false, -- true to color filenames by git status
   },
+  select = {
+    -- Return winid to open the chosen file in, or nil to open in the original window
+    select_window = function(current_buf, action) --[[ default impl ]] end,
+  },
   grep = {
     max_file_size = 10 * 1024 * 1024,
     max_matches_per_file = 100,
@@ -321,6 +342,7 @@ require('fff').setup({
     time_budget_ms = 150,
     modes = { 'plain', 'regex', 'fuzzy' },
     trim_whitespace = false,
+    enable_filename_constraint = false, -- treat filename-like tokens (e.g. `score.rs`) in a grep query as a file-path filter scoping the search; off = searched as literal text
     location_format = ':%d:%d', -- printf format for line:col prefix in grep results, e.g. ':%d' for line-only
   },
   debug = {
@@ -340,9 +362,11 @@ require('fff').setup({
     },
   },
   logging = {
-    enabled = true,
+    -- logs will be written in a parent directory of this file path in files like
+    -- `<stem>+<UTC-timestamp>+<pid>.<ext>`. Run :FFFOpenLog to open current one
     log_file = vim.fn.stdpath('log') .. '/fff.log',
     log_level = 'info',
+    retain_runs = 20,
   },
 })
 ```
@@ -373,6 +397,20 @@ Grep-only:
 - `src/main.rs`. Grep inside a single file.
 
 Mix freely: `git:modified src/**/*.rs !src/**/mod.rs user controller`.
+
+### Open in invoking window
+
+By default fff.nvim will try to open a file in the most suitable window, so any non-file buffers are not affected. You can customize or disable this by providing:
+
+```lua
+require('fff').setup({
+  select = {
+    select_window = function(_current_buf, _action) return nil end,
+  },
+})
+```
+
+Caveat: the chosen file replaces the buffer in the invoking window even if it's a non-modifiable / special buftype. `winfixbuf` windows still fall back to `:split` to avoid `E1513`.
 
 ### Multi-select and quickfix
 
@@ -442,7 +480,9 @@ Run `:FFFScan` to force a rescan.
 ### Troubleshooting
 
 - `:FFFHealth` verifies picker init, optional dependencies, and DB connectivity.
-- `:FFFOpenLog` opens the log file.
+- `:FFFOpenLog` opens the current session's log file.
+- Historical log files are stored near the main log file `<state>/log/fff+<UTC-timestamp>+<pid>.log` (up to 20 files)
+- For a crash backtrace, run `lldb -- nvim` or `gdb -- nvim` and reproduce 
 
 </details>
 

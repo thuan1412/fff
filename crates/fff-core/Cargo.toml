@@ -1,6 +1,6 @@
 [package]
 name = "fff-search"
-version = "0.9.1"
+version = "0.9.4"
 edition = "2024"
 license = "MIT"
 authors = ["Dmitriy Kovalenko <dmtr.kovalenko@outlook.com>"]
@@ -73,6 +73,10 @@ mimalloc = { version = "0.1", optional = true, features = ["local_dynamic_tls"] 
 # Platform-specific: dunce for Windows to avoid \\?\ extended path prefix
 [target.'cfg(windows)'.dependencies]
 dunce = { workspace = true }
+
+# signal-hook only compiles on unix; we wrap the SIGSEGV handler behind cfg(unix)
+[target.'cfg(unix)'.dependencies]
+signal-hook-registry = { workspace = true }
 
 [dev-dependencies]
 criterion = { version = "0.5", features = ["html_reports"] }
